@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cc-ghost"
+version = "0.2.0"
+description = "A ghostwriter for your Claude Code sessions that turns session logs into social media posts in your voice"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic",
+    "python-dotenv",
+]
+
+[project.scripts]
+cc-ghost = "cc_ghost:main"
+
+[project.urls]
+Homepage = "https://github.com/mich312/cc-ghost"
+Repository = "https://github.com/mich312/cc-ghost"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+only-include = ["cc_ghost.py"]

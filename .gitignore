@@ -1,4 +1,4 @@
-# Personal config
+# Personal config (legacy — config now lives in ~/.config/cc-ghost/)
 .env
 persona.md
 .last_run
@@ -14,6 +14,7 @@ dist/
 build/
 .venv/
 venv/
+uv.lock
 
 # OS
 .DS_Store

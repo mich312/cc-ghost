@@ -8,38 +8,42 @@ A ghostwriter for your [Claude Code](https://claude.ai/code) sessions. Reads you
 
 Your published posts feed back as style examples, so the ghostwriter learns your voice over time.
 
-## Prerequisites
+## Install
 
-- [uv](https://docs.astral.sh/uv/)
-- An [Anthropic API key](https://console.anthropic.com/)
+Install as a CLI tool (requires [uv](https://docs.astral.sh/uv/)):
 
-## Setup
+```bash
+uv tool install git+https://github.com/mich312/cc-ghost
+```
+
+Or with pip/pipx:
+
+```bash
+pipx install git+https://github.com/mich312/cc-ghost
+```
+
+On first run, cc-ghost will prompt you for your [Anthropic API key](https://console.anthropic.com/) and walk you through creating a persona. You can also run `cc-ghost --setup` at any time to reconfigure.
+
+Alternatively, run directly without installing:
 
 ```bash
 git clone https://github.com/mich312/cc-ghost.git
 cd cc-ghost
-cp .env.example .env
-# Edit .env and add your ANTHROPIC_API_KEY
-```
-
-On first run, cc-ghost walks you through creating a `persona.md` — your voice, rules, and sample posts that teach the ghostwriter how to write like you. You can also copy the example and edit directly:
-
-```bash
-cp persona.example.md persona.md
+uv run cc-ghost.py
 ```
 
 ## Usage
 
 ```bash
-uv run cc-ghost.py                          # since last run (or last 7 days)
-uv run cc-ghost.py --days 14                # last 14 days
-uv run cc-ghost.py --project                # pick a project (loads all sessions)
-uv run cc-ghost.py --project Mountain       # filter by name
-uv run cc-ghost.py --platform twitter       # optimize for Twitter (280 chars)
-uv run cc-ghost.py --dry-run                # preview sessions, no API call
-uv run cc-ghost.py --setup                  # create/redo persona
-uv run cc-ghost.py --model claude-sonnet-4-5  # override model
-uv run cc-ghost.py --no-refine              # skip interactive refinement
+cc-ghost                                    # since last run (or last 7 days)
+cc-ghost --days 14                          # last 14 days
+cc-ghost --project                          # pick a project (loads all sessions)
+cc-ghost --project Mountain                 # filter by name
+cc-ghost --platform twitter                 # optimize for Twitter (280 chars)
+cc-ghost --dry-run                          # preview sessions, no API call
+cc-ghost --setup                            # configure API key and persona
+cc-ghost --model claude-sonnet-4-5          # override model
+cc-ghost --no-refine                        # skip interactive refinement
 ```
 
 ### Project picker
@@ -94,11 +98,11 @@ After refinement, choose which posts to save:
   Save posts
   Enter post numbers to save (e.g. 1 3 5), 'all', or Enter to skip:
   > 1 4
-  Saved: posts/Mountain-Passes/2026-04-12-build-update.md
-  Saved: posts/Mountain-Passes/2026-04-12-weekly-recap.md
+  Saved: ~/.config/cc-ghost/posts/Mountain-Passes/2026-04-12-build-update.md
+  Saved: ~/.config/cc-ghost/posts/Mountain-Passes/2026-04-12-weekly-recap.md
 ```
 
-Posts are saved as individual markdown files in `posts/` (or `posts/<project>/` when using `--project`). Edit them before publishing.
+Posts are saved as individual markdown files in `~/.config/cc-ghost/posts/`. Edit them before publishing.
 
 ## How it works
 
@@ -150,12 +154,23 @@ Posts are chosen dynamically based on what your sessions actually contain:
 
 ## Configuration
 
+All config lives in `~/.config/cc-ghost/` (or `$XDG_CONFIG_HOME/cc-ghost/`):
+
+| File | Purpose |
+|---|---|
+| `config.env` | API key and model override (created by `--setup`) |
+| `persona.md` | Your voice, rules, and sample posts |
+| `posts/` | Saved posts, organized by project |
+| `.last_run` | Timestamp of last generation |
+
+### Environment variables
+
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `ANTHROPIC_API_KEY` | Yes | — | Your Anthropic API key |
 | `CC_GHOST_MODEL` | No | `claude-haiku-4-5-20251001` | Model to use |
 
-The `--model` flag overrides `CC_GHOST_MODEL`. Set variables in `.env` or your shell.
+The `--model` flag overrides `CC_GHOST_MODEL`. Variables can be set in `~/.config/cc-ghost/config.env`, a `.env` file in the current directory, or your shell environment.
 
 ## License
 
