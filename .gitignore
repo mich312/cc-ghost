@@ -1,6 +1,7 @@
 # Personal config
 .env
 persona.md
+.last_run
 
 # Generated output
 posts/

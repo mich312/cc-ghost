@@ -38,6 +38,7 @@ SCRIPT_DIR = Path(__file__).parent
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 PERSONA_PATH = SCRIPT_DIR / "persona.md"
 POSTS_DIR = SCRIPT_DIR / "posts"
+LAST_RUN_PATH = SCRIPT_DIR / ".last_run"
 
 DEFAULT_MODEL = os.getenv("CC_GHOST_MODEL", "claude-haiku-4-5-20251001")
 
@@ -57,6 +58,24 @@ TEAL   = "\033[36m"
 AMBER  = "\033[33m"
 GREEN  = "\033[32m"
 GRAY   = "\033[90m"
+
+
+# ── Last Run ──────────────────────────────────────────────────────────────────
+
+def load_last_run() -> datetime | None:
+    """Read the last-run timestamp from .last_run, or None if missing."""
+    if not LAST_RUN_PATH.exists():
+        return None
+    try:
+        text = LAST_RUN_PATH.read_text(encoding="utf-8").strip()
+        return datetime.fromisoformat(text)
+    except (ValueError, OSError):
+        return None
+
+
+def save_last_run(dt: datetime) -> None:
+    """Write the last-run timestamp to .last_run."""
+    LAST_RUN_PATH.write_text(dt.isoformat() + "\n", encoding="utf-8")
 
 
 # ── Persona ────────────────────────────────────────────────────────────────────
@@ -237,11 +256,9 @@ def parse_session(filepath: Path) -> dict | None:
     if not messages or first_ts is None:
         return None
 
-    # Derive project name — prefer cwd (actual working directory) over folder name
-    if cwd:
-        project = Path(cwd).name
-    else:
-        project = _project_name_from_folder(filepath.parent.name)
+    # Derive project name from the .claude/projects folder name
+    # (consistent with project discovery in main)
+    project = _project_name_from_folder(filepath.parent.name)
 
     return {
         "file": str(filepath),
@@ -254,36 +271,114 @@ def parse_session(filepath: Path) -> dict | None:
     }
 
 
+def _parse_sessions_index(index_path: Path, from_dt: datetime, to_dt: datetime) -> list[dict]:
+    """Parse a sessions-index.json file and return sessions within the date range.
+
+    This handles newer Claude Code versions where .jsonl files may no longer
+    exist at the top level — the index has enough metadata (firstPrompt,
+    summary, timestamps) to generate posts from.
+    """
+    try:
+        data = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+
+    entries = data.get("entries", [])
+    sessions = []
+    for entry in entries:
+        # Parse created timestamp
+        created_raw = entry.get("created")
+        if not created_raw:
+            continue
+        try:
+            created = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+
+        if not (from_dt <= created <= to_dt):
+            continue
+
+        # Parse modified timestamp
+        modified = created
+        modified_raw = entry.get("modified")
+        if modified_raw:
+            try:
+                modified = datetime.fromisoformat(modified_raw.replace("Z", "+00:00"))
+            except ValueError:
+                pass
+
+        # Skip if the .jsonl file exists — parse_session will handle it
+        full_path = Path(entry.get("fullPath", ""))
+        if full_path.exists():
+            continue
+
+        # Derive project name from folder name (consistent with parse_session)
+        project = _project_name_from_folder(index_path.parent.name)
+
+        # Use firstPrompt and summary as the message content
+        messages = []
+        first_prompt = entry.get("firstPrompt", "")
+        if first_prompt:
+            messages.append(first_prompt.strip())
+        summary = entry.get("summary", "")
+        if summary:
+            messages.append(f"[session summary: {summary}]")
+
+        if not messages:
+            continue
+
+        sessions.append({
+            "file": str(full_path),
+            "project": project,
+            "started_at": created,
+            "ended_at": modified,
+            "duration_min": int((modified - created).total_seconds() / 60),
+            "message_count": entry.get("messageCount", len(messages)),
+            "sampled_messages": messages,
+        })
+
+    return sessions
+
+
 def load_sessions(from_dt: datetime, to_dt: datetime, project_folders: list[Path] | None = None) -> list[dict]:
     """Load all sessions within the date range.
 
     When project_folders is provided, only glob those dirs instead of
     scanning everything under CLAUDE_PROJECTS_DIR.
+
+    Sessions are loaded from .jsonl files first, then from sessions-index.json
+    as a fallback for newer Claude Code versions where .jsonl files may not
+    exist at the top level.
     """
     if not CLAUDE_PROJECTS_DIR.exists():
         print(f"[error] Claude projects directory not found: {CLAUDE_PROJECTS_DIR}")
         print("Make sure you have Claude Code installed and have used it at least once.")
         return []
 
-    if project_folders:
-        all_files = [f for d in project_folders for f in d.glob("*.jsonl")]
-    else:
-        all_files = list(CLAUDE_PROJECTS_DIR.rglob("*.jsonl"))
+    dirs = project_folders if project_folders else [
+        d for d in CLAUDE_PROJECTS_DIR.iterdir() if d.is_dir()
+    ]
 
     sessions = []
 
-    for f in sorted(all_files):
-        # Quick mtime filter before parsing (faster)
-        mtime = datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc)
-        if mtime < from_dt or mtime > to_dt:
-            continue
+    for d in dirs:
+        # 1. Parse top-level .jsonl files (older format)
+        for f in sorted(d.glob("*.jsonl")):
+            mtime = datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc)
+            if mtime < from_dt or mtime > to_dt:
+                continue
 
-        session = parse_session(f)
-        if session is None:
-            continue
+            session = parse_session(f)
+            if session is None:
+                continue
 
-        if from_dt <= session["started_at"] <= to_dt:
-            sessions.append(session)
+            if from_dt <= session["started_at"] <= to_dt:
+                sessions.append(session)
+
+        # 2. Parse sessions-index.json (newer format, fallback for missing .jsonl)
+        index_path = d / "sessions-index.json"
+        if index_path.exists():
+            sessions.extend(_parse_sessions_index(index_path, from_dt, to_dt))
 
     # Sort by start time
     sessions.sort(key=lambda s: s["started_at"])
@@ -666,13 +761,18 @@ def main():
                 if not d.is_dir():
                     continue
                 jsonl_files = list(d.glob("*.jsonl"))
-                if not jsonl_files:
+                index_file = d / "sessions-index.json"
+                if not jsonl_files and not index_file.exists():
                     continue
                 name = _project_name_from_folder(d.name)
-                latest = max(
+                # Get latest mtime from jsonl files or index file
+                mtimes = [
                     datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc)
                     for f in jsonl_files
-                )
+                ]
+                if index_file.exists():
+                    mtimes.append(datetime.fromtimestamp(index_file.stat().st_mtime, tz=timezone.utc))
+                latest = max(mtimes)
                 project_folders_map[name].append(d)
                 if name not in project_info or latest > project_info[name]:
                     project_info[name] = latest
@@ -722,6 +822,7 @@ def main():
         project_folders = project_folders_map.get(selected_project)
 
     # Date range — when --project is used without explicit dates, load all sessions
+    used_last_run = False
     if args.from_date:
         from_dt = datetime.fromisoformat(args.from_date).replace(tzinfo=timezone.utc)
     elif args.days is not None:
@@ -729,7 +830,13 @@ def main():
     elif selected_project and not explicit_date_range:
         from_dt = datetime.min.replace(tzinfo=timezone.utc)
     else:
-        from_dt = now - timedelta(days=7)
+        last_run = load_last_run()
+        if last_run is not None:
+            from_dt = last_run
+            used_last_run = True
+        else:
+            from_dt = now - timedelta(days=7)
+            used_last_run = False
 
     if args.to_date:
         to_dt = datetime.fromisoformat(args.to_date).replace(hour=23, minute=59, tzinfo=timezone.utc)
@@ -740,7 +847,8 @@ def main():
     if selected_project:
         print(f"  {BOLD}Project:{RESET} {selected_project}")
     if from_dt.year > 1:
-        print(f"  Range: {from_dt.strftime('%Y-%m-%d')} → {to_dt.strftime('%Y-%m-%d')}")
+        since = " (since last run)" if used_last_run else ""
+        print(f"  Range: {from_dt.strftime('%Y-%m-%d %H:%M')}{since} → {to_dt.strftime('%Y-%m-%d %H:%M')}")
     print()
 
     sessions = load_sessions(from_dt, to_dt, project_folders=project_folders)
@@ -769,6 +877,7 @@ def main():
 
     print()
     posts = generate_posts(sessions, model=args.model, persona=persona, past_posts=past_posts)
+    save_last_run(now)
 
     print(f"\n{BOLD}{'─' * 60}{RESET}")
     print(f"{BOLD}  Suggested posts{RESET}")

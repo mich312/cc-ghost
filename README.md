@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="cc-ghost.png" alt="cc-ghost logo" width="200">
+</p>
+
 # cc-ghost
 
 A ghostwriter for your [Claude Code](https://claude.ai/code) sessions. Reads your local session logs, analyzes what you built, and drafts social media posts in your voice — then lets you refine them interactively.
