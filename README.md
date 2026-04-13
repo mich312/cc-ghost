@@ -31,12 +31,15 @@ cp persona.example.md persona.md
 ## Usage
 
 ```bash
-uv run cc-ghost.py                    # last 7 days, all projects
-uv run cc-ghost.py --days 14          # last 14 days
-uv run cc-ghost.py --project          # pick a project (loads all sessions)
-uv run cc-ghost.py --project Mountain # filter by name
-uv run cc-ghost.py --dry-run          # preview sessions, no API call
-uv run cc-ghost.py --setup            # create/redo persona
+uv run cc-ghost.py                          # since last run (or last 7 days)
+uv run cc-ghost.py --days 14                # last 14 days
+uv run cc-ghost.py --project                # pick a project (loads all sessions)
+uv run cc-ghost.py --project Mountain       # filter by name
+uv run cc-ghost.py --platform twitter       # optimize for Twitter (280 chars)
+uv run cc-ghost.py --dry-run                # preview sessions, no API call
+uv run cc-ghost.py --setup                  # create/redo persona
+uv run cc-ghost.py --model claude-sonnet-4-5  # override model
+uv run cc-ghost.py --no-refine              # skip interactive refinement
 ```
 
 ### Project picker
@@ -48,13 +51,28 @@ cc-ghost  all projects
 
     1. Customer-Support-Agent  (today)
     2. DiskBuddy  (23d ago)
-    3. Mountain-Passes  (yesterday)
+    3. Film-Tracker  (81d ago)
+    4. Mountain-Passes  (yesterday)
 
   Enter number or name:
   >
 ```
 
 When picking a project without `--days` or `--from`, all sessions for that project are loaded regardless of date.
+
+### Platform targeting
+
+Use `--platform` to tailor posts for a specific platform:
+
+| Platform | Char limit | Tone |
+|---|---|---|
+| `twitter` | 280 | Punchy, concise, no fluff |
+| `bluesky` | 300 | Conversational, slightly nerdy |
+| `mastodon` | 500 | Casual, technical depth welcome |
+| `threads` | 500 | Brief, conversation-starting |
+| `linkedin` | 3000 | Professional but authentic |
+
+Without `--platform`, posts default to 500 characters with no platform-specific tone.
 
 ### Refinement loop
 
@@ -86,10 +104,15 @@ Posts are saved as individual markdown files in `posts/` (or `posts/<project>/` 
 
 1. Loads your **persona** (voice, rules, sample posts) from `persona.md`
 2. Loads **published posts** from `posts/` as style examples — the ghostwriter matches your real voice, not just the persona description
-3. Scans `~/.claude/projects/` for JSONL session logs
-4. Shows a local overview — projects, session counts, activity chart (no API call)
-5. Sends session data to the Claude API to generate focused post drafts
-6. **Refine** interactively, then **save** the ones you want
+3. Scans `~/.claude/projects/` for session logs, session indexes, and session memory summaries
+4. Shows a **local overview** — projects, session counts, activity chart (no API call)
+5. Loads **git commit history** from each project for technical specifics
+6. Sends everything to the Claude API with **effort metrics** (session count, duration, messages per project)
+7. **Refine** interactively, then **save** the ones you want
+
+### Smart date ranges
+
+On the first run, cc-ghost scans the last 7 days. After that, it remembers when you last generated posts and only scans new sessions. Use `--days` or `--from`/`--to` to override.
 
 ### Voice learning
 
@@ -100,6 +123,17 @@ generate → refine → save → edit → publish
                               ↓
                     future runs match your real voice
 ```
+
+### Session data sources
+
+cc-ghost reads from multiple sources to maximize coverage:
+
+- **JSONL session files** — full conversation transcripts (older Claude Code format)
+- **sessions-index.json** — session metadata with first prompt and summary (newer format)
+- **session-memory/summary.md** — rich structured summaries with features completed, files modified, and errors fixed
+- **Git history** — recent commits from each project directory
+
+Sessions are deduplicated by UUID and the richest available data source is preferred.
 
 ## Post types
 

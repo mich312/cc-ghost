@@ -23,6 +23,7 @@ import os
 import sys
 import json
 import argparse
+import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from collections import defaultdict
@@ -44,6 +45,15 @@ DEFAULT_MODEL = os.getenv("CC_GHOST_MODEL", "claude-haiku-4-5-20251001")
 
 # How many user messages to sample per session (keeps tokens low)
 SAMPLE_MESSAGES_PER_SESSION = 12
+
+# Platform-specific post constraints
+PLATFORMS = {
+    "twitter":  {"char_limit": 280,  "tone": "punchy, concise, no fluff — every word counts at 280 chars"},
+    "linkedin": {"char_limit": 3000, "tone": "professional but authentic, can be longer-form, paragraphs ok"},
+    "bluesky":  {"char_limit": 300,  "tone": "conversational, casual, slightly nerdy — Bluesky dev crowd"},
+    "mastodon": {"char_limit": 500,  "tone": "casual, community-oriented, technical depth welcome"},
+    "threads":  {"char_limit": 500,  "tone": "casual and visual, brief, conversation-starting"},
+}
 
 # How many recent published posts to feed as style examples
 PAST_POSTS_LIMIT = 10
@@ -263,6 +273,7 @@ def parse_session(filepath: Path) -> dict | None:
     return {
         "file": str(filepath),
         "project": project,
+        "project_path": cwd,
         "started_at": first_ts,
         "ended_at": last_ts,
         "duration_min": int((last_ts - first_ts).total_seconds() / 60) if last_ts else 0,
@@ -315,14 +326,31 @@ def _parse_sessions_index(index_path: Path, from_dt: datetime, to_dt: datetime) 
         # Derive project name from folder name (consistent with parse_session)
         project = _project_name_from_folder(index_path.parent.name)
 
-        # Use firstPrompt and summary as the message content
+        # Try session-memory/summary.md first — richest data source
+        session_id = entry.get("sessionId", "")
         messages = []
-        first_prompt = entry.get("firstPrompt", "")
-        if first_prompt:
-            messages.append(first_prompt.strip())
-        summary = entry.get("summary", "")
-        if summary:
-            messages.append(f"[session summary: {summary}]")
+        if session_id:
+            memory_path = index_path.parent / session_id / "session-memory" / "summary.md"
+            if memory_path.exists():
+                try:
+                    memory_text = memory_path.read_text(encoding="utf-8").strip()
+                    # Extract key sections (skip template instructions in italics)
+                    for line in memory_text.split("\n"):
+                        if line.startswith("_") and line.endswith("_"):
+                            continue  # skip template instructions
+                        messages.append(line)
+                    messages = ["\n".join(messages).strip()]
+                except OSError:
+                    pass
+
+        # Fall back to firstPrompt + summary from the index
+        if not messages:
+            first_prompt = entry.get("firstPrompt", "")
+            if first_prompt:
+                messages.append(first_prompt.strip())
+            summary = entry.get("summary", "")
+            if summary:
+                messages.append(f"[session summary: {summary}]")
 
         if not messages:
             continue
@@ -330,6 +358,7 @@ def _parse_sessions_index(index_path: Path, from_dt: datetime, to_dt: datetime) 
         sessions.append({
             "file": str(full_path),
             "project": project,
+            "project_path": entry.get("projectPath"),
             "started_at": created,
             "ended_at": modified,
             "duration_min": int((modified - created).total_seconds() / 60),
@@ -380,19 +409,138 @@ def load_sessions(from_dt: datetime, to_dt: datetime, project_folders: list[Path
         if index_path.exists():
             sessions.extend(_parse_sessions_index(index_path, from_dt, to_dt))
 
+        # 3. Scan for session-memory/summary.md in UUID subdirs
+        #    (catches sessions that have neither top-level .jsonl nor index entry)
+        known_ids = {Path(s["file"]).stem for s in sessions if s["file"]}
+        for subdir in d.iterdir():
+            if not subdir.is_dir() or subdir.name in ("memory",):
+                continue
+            if subdir.name in known_ids:
+                continue
+            memory_path = subdir / "session-memory" / "summary.md"
+            if not memory_path.exists():
+                continue
+            mtime = datetime.fromtimestamp(memory_path.stat().st_mtime, tz=timezone.utc)
+            if mtime < from_dt or mtime > to_dt:
+                continue
+            try:
+                text = memory_path.read_text(encoding="utf-8").strip()
+                # Filter out template instruction lines
+                content_lines = [
+                    line for line in text.split("\n")
+                    if not (line.startswith("_") and line.endswith("_"))
+                ]
+                content = "\n".join(content_lines).strip()
+            except OSError:
+                continue
+            if not content:
+                continue
+            project = _project_name_from_folder(d.name)
+            sessions.append({
+                "file": str(subdir / "summary.md"),
+                "project": project,
+                "project_path": None,
+                "started_at": mtime,
+                "ended_at": mtime,
+                "duration_min": 0,
+                "message_count": 0,
+                "sampled_messages": [content],
+            })
+
+    # Deduplicate sessions that appear in multiple project subdirs
+    # (same session UUID can exist in nested project folders).
+    # Prefer the session from the shortest file path (the "real" project
+    # folder, not subdirectories like Assets.xcassets).
+    sessions.sort(key=lambda s: len(s["file"]))
+    seen: set[str] = set()
+    unique = []
+    for s in sessions:
+        # Extract session UUID from file path
+        file_path = Path(s["file"])
+        if file_path.stem == "summary":
+            session_id = file_path.parent.name
+        else:
+            session_id = file_path.stem
+        if session_id in seen:
+            continue
+        seen.add(session_id)
+        unique.append(s)
+
     # Sort by start time
-    sessions.sort(key=lambda s: s["started_at"])
-    return sessions
+    unique.sort(key=lambda s: s["started_at"])
+    return unique
+
+
+# ── Git Integration ───────────────────────────────────────────────────────────
+
+# Max commits per project to keep prompt size reasonable
+GIT_LOG_LIMIT = 15
+
+
+def load_git_logs(sessions: list[dict], from_dt: datetime) -> dict[str, list[str]]:
+    """Collect recent git commits for each unique project path.
+
+    Returns a dict mapping project name to a list of one-line commit strings.
+    """
+    # Collect unique project paths
+    project_paths: dict[str, str] = {}  # project name → path
+    for s in sessions:
+        path = s.get("project_path")
+        if path and s["project"] not in project_paths:
+            project_paths[s["project"]] = path
+
+    logs: dict[str, list[str]] = {}
+    since = from_dt.strftime("%Y-%m-%d")
+
+    for project, path in project_paths.items():
+        git_dir = Path(path)
+        if not (git_dir / ".git").exists() and not git_dir.exists():
+            continue
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(git_dir), "log",
+                 f"--since={since}", f"--max-count={GIT_LOG_LIMIT}",
+                 "--oneline", "--no-merges"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                commits = [line.strip() for line in result.stdout.strip().split("\n") if line.strip()]
+                if commits:
+                    logs[project] = commits
+        except (subprocess.TimeoutExpired, OSError):
+            continue
+
+    return logs
 
 
 # ── Claude API ──────────────────────────────────────────────────────────────────
 
-def build_post_prompt(sessions: list[dict], persona: str, past_posts: list[str]) -> str:
+def _compute_effort(sessions: list[dict]) -> str:
+    """Compute effort metrics from sessions for the prompt."""
+    total_min = sum(s["duration_min"] for s in sessions)
+    total_msgs = sum(s["message_count"] for s in sessions)
+
+    # Per-project breakdown
+    by_project: dict[str, dict] = defaultdict(lambda: {"sessions": 0, "minutes": 0})
+    for s in sessions:
+        by_project[s["project"]]["sessions"] += 1
+        by_project[s["project"]]["minutes"] += s["duration_min"]
+
+    lines = [f"Total: {len(sessions)} sessions, ~{total_min} min, {total_msgs} messages"]
+    for name, stats in sorted(by_project.items(), key=lambda x: -x[1]["sessions"]):
+        lines.append(f"  {name}: {stats['sessions']} sessions, ~{stats['minutes']} min")
+
+    return "\n".join(lines)
+
+
+def build_post_prompt(sessions: list[dict], persona: str, past_posts: list[str],
+                      git_logs: dict[str, list[str]] | None = None,
+                      platform: str | None = None) -> str:
     """Build a prompt that asks ONLY for post drafts (no summary/digest)."""
     lines = []
     for i, s in enumerate(sessions, 1):
         date_str = s["started_at"].strftime("%a %b %d, %H:%M")
-        lines.append(f"\n--- Session {i}: {s['project']} | {date_str} | {s['duration_min']} min ---")
+        lines.append(f"\n--- Session {i}: {s['project']} | {date_str} | {s['duration_min']} min | {s['message_count']} messages ---")
         for msg in s["sampled_messages"]:
             short = msg[:300] + "…" if len(msg) > 300 else msg
             lines.append(f"  > {short}")
@@ -411,17 +559,37 @@ def build_post_prompt(sessions: list[dict], persona: str, past_posts: list[str])
         for i, pp in enumerate(past_posts, 1):
             past_section += f"\n--- Published post {i} ---\n{pp}\n"
 
+    git_section = ""
+    if git_logs:
+        git_section = "\n\nRECENT GIT COMMITS (what was actually shipped — use for technical specifics):\n"
+        for project, commits in git_logs.items():
+            git_section += f"\n--- {project} ---\n"
+            for c in commits:
+                git_section += f"  {c}\n"
+
+    # Effort metrics
+    effort = _compute_effort(sessions)
+
+    # Platform constraints
+    plat = PLATFORMS.get(platform, {}) if platform else {}
+    char_limit = plat.get("char_limit", 500)
+    platform_tone = plat.get("tone", "")
+    platform_instruction = f"\nTARGET PLATFORM: {platform}\nTone: {platform_tone}" if platform else ""
+
     return f"""You are a social media ghostwriter.
 Read these Claude Code sessions and generate post drafts.
 
 {persona_section}
-{past_section}
+{past_section}{platform_instruction}
 DATE RANGE: {date_range}
 TOTAL SESSIONS: {len(sessions)}
 
+EFFORT METRICS (use naturally in posts where relevant — don't force it):
+{effort}
+
 SESSION LOG (user messages sampled from each session):
 {sessions_text}
-
+{git_section}
 ---
 
 Generate posts as a valid JSON array with this structure:
@@ -429,7 +597,7 @@ Generate posts as a valid JSON array with this structure:
 [
   {{
     "type": "<post-type>",
-    "draft": "post text here, ready to copy, authentic voice, max 500 chars",
+    "draft": "post text here, ready to copy, authentic voice, max {char_limit} chars",
     "source": "which session or topic this comes from"
   }}
 ]
@@ -445,20 +613,22 @@ Available post types (choose 4-6 that fit what actually happened):
 Pick types based on what the sessions contain. Don't force a type if the sessions don't support it.
 Always include a "weekly-recap". Prefer variety over repetition.
 Write posts in first person, casual, no cringe startup-speak.
+Each post must be under {char_limit} characters.
 Return ONLY the JSON array, no markdown fences, no preamble.
 """
 
 
-def generate_posts(sessions: list[dict], model: str, persona: str, past_posts: list[str]) -> list[dict]:
+def generate_posts(sessions: list[dict], model: str, persona: str, past_posts: list[str],
+                    git_logs: dict[str, list[str]] | None = None, platform: str | None = None) -> list[dict]:
     """Call Claude API to generate post drafts. Returns a list of post dicts."""
     client = anthropic.Anthropic()
-    prompt = build_post_prompt(sessions, persona, past_posts)
+    prompt = build_post_prompt(sessions, persona, past_posts, git_logs=git_logs, platform=platform)
 
     print(f"  Calling Claude API ({model})…")
     try:
         response = client.messages.create(
             model=model,
-            max_tokens=1500,
+            max_tokens=2500,
             messages=[{"role": "user", "content": prompt}],
         )
     except anthropic.APIError as e:
@@ -475,9 +645,22 @@ def generate_posts(sessions: list[dict], model: str, persona: str, past_posts: l
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        print(f"\n{BOLD}[error]{RESET} Failed to parse API response as JSON.")
-        print(f"Raw response:\n{raw[:500]}")
-        sys.exit(1)
+        # Attempt truncation recovery — close unclosed brackets
+        recovered = raw.rstrip().rstrip(",")
+        if not recovered.endswith("]"):
+            # Try closing the last object and the array
+            if recovered.endswith("}"):
+                recovered += "]"
+            else:
+                recovered += "}]"
+        try:
+            posts = json.loads(recovered)
+            print(f"  {AMBER}[warn]{RESET} Response was truncated, recovered {len(posts)} post(s).")
+            return posts
+        except json.JSONDecodeError:
+            print(f"\n{BOLD}[error]{RESET} Failed to parse API response as JSON.")
+            print(f"Raw response:\n{raw[:500]}")
+            sys.exit(1)
 
 
 # ── Output ──────────────────────────────────────────────────────────────────────
@@ -729,6 +912,7 @@ def main():
     parser.add_argument("--to", dest="to_date", help="End date YYYY-MM-DD (default: today)")
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Anthropic model to use (default: {DEFAULT_MODEL})")
     parser.add_argument("--project", nargs="?", const="__pick__", help="Filter by project (shows picker if no name given)")
+    parser.add_argument("--platform", choices=["twitter", "linkedin", "bluesky", "mastodon", "threads"], default=None, help="Target platform (adjusts length and tone)")
     parser.add_argument("--dry-run", action="store_true", help="List sessions found, skip API call")
     parser.add_argument("--no-refine", action="store_true", help="Skip the interactive refinement loop")
     parser.add_argument("--setup", action="store_true", help="Run persona setup (create/overwrite persona.md)")
@@ -875,12 +1059,19 @@ def main():
     if past_posts:
         print(f"  {DIM}Loaded {len(past_posts)} published post(s) as style reference.{RESET}")
 
+    # Load git commit history for each project
+    git_logs = load_git_logs(sessions, from_dt)
+    if git_logs:
+        total = sum(len(c) for c in git_logs.values())
+        print(f"  {DIM}Loaded {total} git commit(s) from {len(git_logs)} project(s).{RESET}")
+
     print()
-    posts = generate_posts(sessions, model=args.model, persona=persona, past_posts=past_posts)
+    posts = generate_posts(sessions, model=args.model, persona=persona, past_posts=past_posts, git_logs=git_logs, platform=args.platform)
     save_last_run(now)
 
+    plat_label = f"  ·  {args.platform}" if args.platform else ""
     print(f"\n{BOLD}{'─' * 60}{RESET}")
-    print(f"{BOLD}  Suggested posts{RESET}")
+    print(f"{BOLD}  Suggested posts{plat_label}{RESET}")
     print(f"{BOLD}{'─' * 60}{RESET}\n")
 
     print_posts(posts)
