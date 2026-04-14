@@ -4,6 +4,8 @@
 # dependencies = [
 #     "anthropic",
 #     "python-dotenv",
+#     "rich",
+#     "questionary",
 # ]
 # ///
 """
@@ -31,6 +33,14 @@ from collections import defaultdict
 
 from dotenv import load_dotenv
 import anthropic
+import questionary
+from prompt_toolkit import prompt as pt_prompt
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+
+
+console = Console()
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
@@ -57,22 +67,11 @@ PLATFORMS = {
     "bluesky":  {"char_limit": 300,  "tone": "conversational, casual, slightly nerdy — Bluesky dev crowd"},
     "mastodon": {"char_limit": 500,  "tone": "casual, community-oriented, technical depth welcome"},
     "threads":  {"char_limit": 500,  "tone": "casual and visual, brief, conversation-starting"},
+    "blog":     {"char_limit": 0,   "tone": "long-form devlog, narrative, technical depth, markdown with headings and code blocks"},
 }
 
 # How many recent published posts to feed as style examples
 PAST_POSTS_LIMIT = 10
-
-# ── ANSI Colors ────────────────────────────────────────────────────────────────
-
-RESET  = "\033[0m"
-BOLD   = "\033[1m"
-DIM    = "\033[2m"
-PURPLE = "\033[35m"
-TEAL   = "\033[36m"
-AMBER  = "\033[33m"
-GREEN  = "\033[32m"
-GRAY   = "\033[90m"
-
 
 # ── Last Run ──────────────────────────────────────────────────────────────────
 
@@ -108,29 +107,28 @@ def _has_api_key() -> bool:
 def setup_api_key():
     """Interactive API key setup."""
     _ensure_config_dir()
-    print(f"\n{BOLD}cc-ghost — API key setup{RESET}\n")
+    console.print("\n[bold]cc-ghost — API key setup[/bold]\n")
 
     current = os.environ.get("ANTHROPIC_API_KEY", "")
     if current:
         masked = current[:10] + "…" + current[-4:]
-        print(f"  Current key: {DIM}{masked}{RESET}")
-        print(f"  {DIM}Press Enter to keep it, or paste a new one:{RESET}")
+        console.print(f"  Current key: [dim]{masked}[/dim]")
+        console.print("  [dim]Press Enter to keep it, or paste a new one:[/dim]")
     else:
-        print(f"  You need an Anthropic API key from {TEAL}https://console.anthropic.com/{RESET}")
-        print(f"  {DIM}Paste your key:{RESET}")
+        console.print("  You need an Anthropic API key from [cyan]https://console.anthropic.com/[/cyan]")
+        console.print("  [dim]Paste your key:[/dim]")
 
-    try:
-        key = input(f"  {TEAL}>{RESET} ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print()
+    key = questionary.password("  >").ask()
+    if key is None:
         return
+    key = key.strip()
 
     if not key and current:
-        print(f"  {DIM}Keeping existing key.{RESET}")
+        console.print("  [dim]Keeping existing key.[/dim]")
         return
 
     if not key:
-        print(f"  {AMBER}No key provided.{RESET}")
+        console.print("  [yellow]No key provided.[/yellow]")
         return
 
     # Read existing config.env or start fresh
@@ -144,7 +142,7 @@ def setup_api_key():
     CONFIG_ENV_PATH.write_text("\n".join(env_lines).strip() + "\n", encoding="utf-8")
     CONFIG_ENV_PATH.chmod(0o600)
     os.environ["ANTHROPIC_API_KEY"] = key
-    print(f"\n  {GREEN}Saved:{RESET} {CONFIG_ENV_PATH}")
+    console.print(f"\n  [green]Saved:[/green] {CONFIG_ENV_PATH}")
 
 
 def load_persona() -> str:
@@ -157,47 +155,38 @@ def load_persona() -> str:
 def setup_persona():
     """Interactive first-run setup that creates persona.md."""
     _ensure_config_dir()
-    print(f"\n{BOLD}cc-ghost — persona setup{RESET}\n")
-    print("  Let's set up your ghostwriter persona.\n")
+    console.print("\n[bold]cc-ghost — persona setup[/bold]\n")
+    console.print("  Let's set up your ghostwriter persona.\n")
 
-    print(f"  {BOLD}1. Voice{RESET} — Who are you? What do you build? What's your tone?")
-    print(f"  {DIM}(A few sentences. Press Enter twice when done.){RESET}\n")
-    voice_lines = []
-    while True:
-        line = input("    ")
-        if not line and voice_lines and not voice_lines[-1]:
-            voice_lines.pop()
-            break
-        voice_lines.append(line)
-    voice = "\n".join(voice_lines).strip()
+    console.print("  [bold]1. Voice[/bold] — Who are you? What do you build? What's your tone?")
+    console.print("  [dim](A few sentences. Meta+Enter or Esc then Enter to submit.)[/dim]\n")
+    try:
+        voice = pt_prompt("    ", multiline=True).strip()
+    except (EOFError, KeyboardInterrupt):
+        return
 
-    print(f"\n  {BOLD}2. Rules{RESET} — What should the ghostwriter always/never do?")
-    print(f"  {DIM}(One rule per line. Press Enter twice when done.){RESET}\n")
-    rules = []
-    while True:
-        line = input("    ")
-        if not line and rules and not rules[-1]:
-            rules.pop()
-            break
-        rules.append(line)
-    rules_text = "\n".join(f"- {r}" if r and not r.startswith("-") else r for r in rules).strip()
+    console.print("\n  [bold]2. Rules[/bold] — What should the ghostwriter always/never do?")
+    console.print("  [dim](One rule per line. Meta+Enter or Esc then Enter to submit.)[/dim]\n")
+    try:
+        rules_raw = pt_prompt("    ", multiline=True).strip()
+    except (EOFError, KeyboardInterrupt):
+        return
+    rules_text = "\n".join(
+        f"- {r}" if r and not r.startswith("-") else r
+        for r in rules_raw.split("\n")
+    ).strip()
 
-    print(f"\n  {BOLD}3. Sample posts{RESET} — Paste 3-5 real posts you've written.")
-    print(f"  {DIM}(Paste one post, press Enter twice, repeat. Empty to finish.){RESET}\n")
+    console.print("\n  [bold]3. Sample posts[/bold] — Paste real posts you've written.")
+    console.print("  [dim](Meta+Enter to submit each. Empty submission to finish.)[/dim]\n")
     samples = []
     while True:
-        sample_lines = []
-        while True:
-            line = input("    ")
-            if not line and sample_lines and not sample_lines[-1]:
-                sample_lines.pop()
-                break
-            if not line and not sample_lines:
-                break
-            sample_lines.append(line)
-        if not sample_lines:
+        try:
+            sample = pt_prompt("    ", multiline=True).strip()
+        except (EOFError, KeyboardInterrupt):
             break
-        samples.append("\n".join(sample_lines).strip())
+        if not sample:
+            break
+        samples.append(sample)
 
     # Build persona.md
     lines = ["# Persona", "", "## Voice", "", "```", voice, "```", ""]
@@ -208,8 +197,8 @@ def setup_persona():
             lines += ["```", s, "```", ""]
 
     PERSONA_PATH.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(f"\n  {GREEN}Saved:{RESET} {PERSONA_PATH}")
-    print(f"  {DIM}Edit this file anytime to adjust your voice.{RESET}\n")
+    console.print(f"\n  [green]Saved:[/green] {PERSONA_PATH}")
+    console.print("  [dim]Edit this file anytime to adjust your voice.[/dim]\n")
 
 
 # ── Past Posts ─────────────────────────────────────────────────────────────────
@@ -438,8 +427,8 @@ def load_sessions(from_dt: datetime, to_dt: datetime, project_folders: list[Path
     exist at the top level.
     """
     if not CLAUDE_PROJECTS_DIR.exists():
-        print(f"[error] Claude projects directory not found: {CLAUDE_PROJECTS_DIR}")
-        print("Make sure you have Claude Code installed and have used it at least once.")
+        console.print(f"[bold red]\\[error][/bold red] Claude projects directory not found: {CLAUDE_PROJECTS_DIR}")
+        console.print("Make sure you have Claude Code installed and have used it at least once.")
         return []
 
     dirs = project_folders if project_folders else [
@@ -591,10 +580,9 @@ def _compute_effort(sessions: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def build_post_prompt(sessions: list[dict], persona: str, past_posts: list[str],
-                      git_logs: dict[str, list[str]] | None = None,
-                      platform: str | None = None) -> str:
-    """Build a prompt that asks ONLY for post drafts (no summary/digest)."""
+def _format_sessions_for_prompt(sessions: list[dict], persona: str, past_posts: list[str],
+                                git_logs: dict[str, list[str]] | None = None) -> dict[str, str]:
+    """Build shared context sections used by both post and blog prompts."""
     lines = []
     for i, s in enumerate(sessions, 1):
         date_str = s["started_at"].strftime("%a %b %d, %H:%M")
@@ -607,7 +595,7 @@ def build_post_prompt(sessions: list[dict], persona: str, past_posts: list[str],
     date_range = f"{sessions[0]['started_at'].strftime('%b %d')} – {sessions[-1]['started_at'].strftime('%b %d, %Y')}"
 
     persona_section = f"""PERSONA (voice, rules, and sample posts — match this style closely):
-{persona}""" if persona else "Write posts in first person, casual tone."
+{persona}""" if persona else "Write in first person, casual tone."
 
     past_section = ""
     if past_posts:
@@ -625,8 +613,24 @@ def build_post_prompt(sessions: list[dict], persona: str, past_posts: list[str],
             for c in commits:
                 git_section += f"  {c}\n"
 
-    # Effort metrics
     effort = _compute_effort(sessions)
+
+    return {
+        "sessions_text": sessions_text,
+        "date_range": date_range,
+        "persona_section": persona_section,
+        "past_section": past_section,
+        "git_section": git_section,
+        "effort": effort,
+        "session_count": str(len(sessions)),
+    }
+
+
+def build_post_prompt(sessions: list[dict], persona: str, past_posts: list[str],
+                      git_logs: dict[str, list[str]] | None = None,
+                      platform: str | None = None) -> str:
+    """Build a prompt that asks ONLY for post drafts (no summary/digest)."""
+    ctx = _format_sessions_for_prompt(sessions, persona, past_posts, git_logs)
 
     # Platform constraints
     plat = PLATFORMS.get(platform, {}) if platform else {}
@@ -637,17 +641,17 @@ def build_post_prompt(sessions: list[dict], persona: str, past_posts: list[str],
     return f"""You are a social media ghostwriter.
 Read these Claude Code sessions and generate post drafts.
 
-{persona_section}
-{past_section}{platform_instruction}
-DATE RANGE: {date_range}
-TOTAL SESSIONS: {len(sessions)}
+{ctx["persona_section"]}
+{ctx["past_section"]}{platform_instruction}
+DATE RANGE: {ctx["date_range"]}
+TOTAL SESSIONS: {ctx["session_count"]}
 
 EFFORT METRICS (use naturally in posts where relevant — don't force it):
-{effort}
+{ctx["effort"]}
 
 SESSION LOG (user messages sampled from each session):
-{sessions_text}
-{git_section}
+{ctx["sessions_text"]}
+{ctx["git_section"]}
 ---
 
 Generate posts as a valid JSON array with this structure:
@@ -682,16 +686,16 @@ def generate_posts(sessions: list[dict], model: str, persona: str, past_posts: l
     client = anthropic.Anthropic()
     prompt = build_post_prompt(sessions, persona, past_posts, git_logs=git_logs, platform=platform)
 
-    print(f"  Calling Claude API ({model})…")
-    try:
-        response = client.messages.create(
-            model=model,
-            max_tokens=2500,
-            messages=[{"role": "user", "content": prompt}],
-        )
-    except anthropic.APIError as e:
-        print(f"\n{BOLD}[error]{RESET} API call failed: {e}")
-        sys.exit(1)
+    with console.status(f"Calling Claude API ({model})…"):
+        try:
+            response = client.messages.create(
+                model=model,
+                max_tokens=2500,
+                messages=[{"role": "user", "content": prompt}],
+            )
+        except anthropic.APIError as e:
+            console.print(f"\n[bold red]\\[error][/bold red] API call failed: {e}")
+            sys.exit(1)
 
     raw = response.content[0].text.strip()
     if raw.startswith("```"):
@@ -713,12 +717,183 @@ def generate_posts(sessions: list[dict], model: str, persona: str, past_posts: l
                 recovered += "}]"
         try:
             posts = json.loads(recovered)
-            print(f"  {AMBER}[warn]{RESET} Response was truncated, recovered {len(posts)} post(s).")
+            console.print(f"  [yellow]\\[warn][/yellow] Response was truncated, recovered {len(posts)} post(s).")
             return posts
         except json.JSONDecodeError:
-            print(f"\n{BOLD}[error]{RESET} Failed to parse API response as JSON.")
-            print(f"Raw response:\n{raw[:500]}")
+            console.print("[bold red]\\[error][/bold red] Failed to parse API response as JSON.")
+            console.print(f"Raw response:\n{raw[:500]}")
             sys.exit(1)
+
+
+# ── Blog ─────────────────────────────────────────────────────────────────────
+
+def build_blog_prompt(sessions: list[dict], persona: str, past_posts: list[str],
+                      git_logs: dict[str, list[str]] | None = None) -> str:
+    """Build a prompt for generating a long-form devlog blog post."""
+    ctx = _format_sessions_for_prompt(sessions, persona, past_posts, git_logs)
+
+    return f"""You are a technical blog ghostwriter.
+Read these Claude Code sessions and write a single devlog blog post.
+
+{ctx["persona_section"]}
+{ctx["past_section"]}
+DATE RANGE: {ctx["date_range"]}
+TOTAL SESSIONS: {ctx["session_count"]}
+
+EFFORT METRICS (weave in naturally — don't list them robotically):
+{ctx["effort"]}
+
+SESSION LOG (user messages sampled from each session):
+{ctx["sessions_text"]}
+{ctx["git_section"]}
+---
+
+Write a devlog blog post in markdown. Guidelines:
+
+- Start with a title as `# Title` — make it specific and interesting, not generic
+- 800-2000 words depending on how much happened
+- Use `##` sections to organize by theme, feature, or narrative arc — NOT one section per session
+- Weave a narrative: what you set out to do, what happened, what you learned
+- Include concrete technical details: architecture decisions, tradeoffs, code snippets where relevant
+- Be honest about struggles, dead ends, and surprises — that's what makes devlogs interesting
+- End with what's next or open questions
+- Write in first person, authentic voice — this is your dev journal, not a press release
+- Use code blocks (```language) for any code snippets
+- No preamble, no "here's your blog post" — just the markdown content
+"""
+
+
+def generate_blog(sessions: list[dict], model: str, persona: str, past_posts: list[str],
+                   git_logs: dict[str, list[str]] | None = None) -> str:
+    """Call Claude API to generate a blog post. Returns markdown string."""
+    client = anthropic.Anthropic()
+    prompt = build_blog_prompt(sessions, persona, past_posts, git_logs=git_logs)
+
+    with console.status(f"Generating blog post ({model})…"):
+        try:
+            response = client.messages.create(
+                model=model,
+                max_tokens=4096,
+                messages=[{"role": "user", "content": prompt}],
+            )
+        except anthropic.APIError as e:
+            console.print(f"\n[bold red]\\[error][/bold red] API call failed: {e}")
+            sys.exit(1)
+
+    raw = response.content[0].text.strip()
+    # Strip wrapping markdown fence if the model added one
+    if raw.startswith("```markdown"):
+        raw = raw[len("```markdown"):].strip()
+    if raw.startswith("```md"):
+        raw = raw[len("```md"):].strip()
+    if raw.endswith("```"):
+        raw = raw[:-3].strip()
+    return raw
+
+
+def print_blog(blog: str):
+    """Display a blog post in the terminal using rich markdown."""
+    from rich.markdown import Markdown
+    console.print()
+    console.print(Markdown(blog), width=min(80, console.width - 4))
+    console.print()
+
+
+def refine_blog(blog: str, model: str, persona: str) -> str:
+    """Interactive loop for refining a blog post."""
+    client = anthropic.Anthropic()
+    conversation = [
+        {"role": "assistant", "content": blog},
+    ]
+
+    persona_hint = f"\n\nPERSONA:\n{persona}" if persona else ""
+
+    while True:
+        choices = [
+            questionary.Choice("Edit directly", value="edit"),
+            questionary.Choice("Refine with AI feedback", value="refine"),
+            questionary.Choice("Accept and continue", value="accept"),
+        ]
+
+        action = questionary.select("What would you like to do?", choices=choices).ask()
+        if action is None or action == "accept":
+            break
+
+        if action == "edit":
+            try:
+                edited = pt_prompt("Edit blog (Meta+Enter to submit):\n", default=blog, multiline=True)
+            except (EOFError, KeyboardInterrupt):
+                continue
+            edited = edited.strip()
+            if edited and edited != blog:
+                blog = edited
+                conversation.append({"role": "user", "content": f"I manually edited the post to:\n\n{edited}"})
+                conversation.append({"role": "assistant", "content": edited})
+            console.print()
+            print_blog(blog)
+
+        elif action == "refine":
+            try:
+                feedback = pt_prompt("Feedback: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                continue
+            if not feedback:
+                continue
+
+            conversation.append({"role": "user", "content": feedback})
+
+            with console.status("Refining…"):
+                try:
+                    response = client.messages.create(
+                        model=model,
+                        max_tokens=4096,
+                        system=f"""You are refining a devlog blog post.
+{persona_hint}
+
+You were given a blog post in markdown and the user is giving feedback.
+Apply their feedback and return the updated blog post.
+Return ONLY the markdown content, no wrapping fences, no preamble.""",
+                        messages=conversation,
+                    )
+                except anthropic.APIError as e:
+                    console.print(f"\n[bold red]\\[error][/bold red] API call failed: {e}")
+                    continue
+
+            blog = response.content[0].text.strip()
+            if blog.startswith("```markdown"):
+                blog = blog[len("```markdown"):].strip()
+            if blog.startswith("```md"):
+                blog = blog[len("```md"):].strip()
+            if blog.endswith("```"):
+                blog = blog[:-3].strip()
+
+            conversation.append({"role": "assistant", "content": blog})
+
+            console.print()
+            print_blog(blog)
+
+    return blog
+
+
+def save_blog(blog: str, date_str: str, project: str | None = None):
+    """Save blog post as a markdown file."""
+    out_dir = POSTS_DIR / project if project else POSTS_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    filename = f"{date_str}-blog.md"
+    path = out_dir / filename
+    counter = 2
+    while path.exists():
+        path = out_dir / f"{date_str}-blog-{counter}.md"
+        counter += 1
+
+    save = questionary.confirm(f"Save blog post to {path}?", default=True).ask()
+    if save is None or not save:
+        console.print("  [dim]Blog post not saved.[/dim]")
+        return
+
+    path.write_text(blog + "\n", encoding="utf-8")
+    console.print(f"  [green]Saved:[/green] {path}")
 
 
 # ── Output ──────────────────────────────────────────────────────────────────────
@@ -726,43 +901,43 @@ def generate_posts(sessions: list[dict], model: str, persona: str, past_posts: l
 POST_TYPES = {
     "build-update": {
         "label": "Build update",
-        "color": GREEN,
+        "color": "green",
         "freq":  "30-35% of posts · weekly+",
         "desc":  "What you shipped or are working on. Demos, screenshots, progress.",
     },
     "lesson": {
         "label": "Lesson",
-        "color": AMBER,
+        "color": "yellow",
         "freq":  "25-30% of posts · weekly",
         "desc":  "Specific insight or decision. Not generic advice.",
     },
     "behind-the-scenes": {
         "label": "Behind the scenes",
-        "color": PURPLE,
+        "color": "magenta",
         "freq":  "20-25% of posts · weekly",
         "desc":  "Process, struggles, personal context. The human side.",
     },
     "engagement": {
         "label": "Engagement",
-        "color": TEAL,
+        "color": "cyan",
         "freq":  "15-20% of posts · weekly",
         "desc":  "Questions, polls, asking for input. Community building.",
     },
     "milestone": {
         "label": "Milestone",
-        "color": GREEN,
+        "color": "green",
         "freq":  "rare · 1-3x/month",
         "desc":  "Concrete numbers, launches, celebrations. High impact.",
     },
     "weekly-recap": {
         "label": "Weekly recap",
-        "color": TEAL,
+        "color": "cyan",
         "freq":  "1x/week",
         "desc":  "Casual wrap-up of the week's work.",
     },
     "win": {  # legacy compat
         "label": "Win",
-        "color": GREEN,
+        "color": "green",
         "freq":  "30-35% of posts",
         "desc":  "Shipped something.",
     },
@@ -774,26 +949,30 @@ def print_overview(sessions: list[dict]):
     last = sessions[-1]["started_at"]
     date_range = f"{first.strftime('%b %d')} – {last.strftime('%b %d, %Y')}"
 
-    print()
-    print(f"{BOLD}{'─' * 60}{RESET}")
-    print(f"{BOLD}  Claude Code Overview  ·  {date_range}{RESET}")
-    print(f"{BOLD}{'─' * 60}{RESET}")
-    print()
+    console.print()
+    console.rule(f"[bold]Claude Code Overview  ·  {date_range}[/bold]")
+    console.print()
 
-    print(f"  {BOLD}Sessions:{RESET} {len(sessions)}")
-    print()
+    console.print(f"  [bold]Sessions:[/bold] {len(sessions)}")
+    console.print()
 
     # Projects breakdown
     projects: dict[str, int] = defaultdict(int)
     for s in sessions:
         projects[s["project"]] += 1
-    print(f"  {BOLD}Projects:{RESET}")
+    table = Table(show_header=False, box=None, padding=(0, 1), pad_edge=False)
+    table.add_column(width=2)  # left indent
+    table.add_column(style="cyan", width=1)
+    table.add_column()
+    table.add_column(style="dim")
     for name, count in sorted(projects.items(), key=lambda x: -x[1]):
-        print(f"    {TEAL}·{RESET} {name}  {DIM}({count} sessions){RESET}")
-    print()
+        table.add_row("", "·", name, f"({count} sessions)")
+    console.print("  [bold]Projects:[/bold]")
+    console.print(table)
+    console.print()
 
     # Activity timeline
-    print(f"  {BOLD}Activity:{RESET}")
+    console.print("  [bold]Activity:[/bold]")
     by_day: dict[datetime, int] = defaultdict(int)
     for sess in sessions:
         day = sess["started_at"].replace(hour=0, minute=0, second=0, microsecond=0)
@@ -802,42 +981,40 @@ def print_overview(sessions: list[dict]):
     for day, count in sorted(by_day.items()):
         label = day.strftime("%a %b %d")
         bar = "█" * count + "░" * (max_count - count)
-        print(f"    {DIM}{label}{RESET}  {TEAL}{bar}{RESET}  {count}")
-    print()
+        console.print(f"    [dim]{label}[/dim]  [cyan]{bar}[/cyan]  {count}")
+    console.print()
 
 
 def print_posts(posts: list[dict]):
+    width = min(70, console.width - 4)
     for i, post in enumerate(posts, 1):
         ptype = post.get("type", "")
         info = POST_TYPES.get(ptype, {})
-        color = info.get("color", RESET)
+        color = info.get("color", "default")
         label = info.get("label", ptype)
         freq = info.get("freq", "")
         source = post.get("source", "")
         draft = post.get("draft", "")
 
-        print(f"  {color}{BOLD}[{i}. {label}]{RESET}  {DIM}{source}{RESET}")
+        subtitle = f"[dim]{source}[/dim]"
         if freq:
-            print(f"  {DIM}recommended: {freq}{RESET}")
-        print()
-        # Word-wrap the draft at 70 chars
-        words = draft.split()
-        line = "    "
-        for word in words:
-            if len(line) + len(word) + 1 > 74:
-                print(line)
-                line = "    " + word + " "
-            else:
-                line += word + " "
-        if line.strip():
-            print(line)
-        print()
-        print(f"  {DIM}{'─' * 56}{RESET}")
-        print()
+            subtitle += f"  [dim]· {freq}[/dim]"
+
+        panel = Panel(
+            draft,
+            title=f"[bold]{i}. {label}[/bold]",
+            title_align="left",
+            subtitle=subtitle,
+            subtitle_align="left",
+            border_style=color,
+            width=width,
+            padding=(1, 2),
+        )
+        console.print(panel)
 
 
 def refine_posts(posts: list[dict], model: str, persona: str) -> list[dict]:
-    """Interactive loop: let the user give feedback and regenerate posts."""
+    """Interactive loop: edit directly, refine with AI, or accept."""
     client = anthropic.Anthropic()
     conversation = [
         {"role": "assistant", "content": json.dumps(posts, indent=2)},
@@ -846,83 +1023,104 @@ def refine_posts(posts: list[dict], model: str, persona: str) -> list[dict]:
     persona_hint = f"\n\nPERSONA:\n{persona}" if persona else ""
 
     while True:
-        print(f"  {DIM}Give feedback to refine, or press Enter to accept:{RESET}")
-        try:
-            feedback = input(f"  {TEAL}>{RESET} ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
+        # Build choices: each post as an editable pick, plus refine-all and accept
+        choices = []
+        for i, p in enumerate(posts, 1):
+            label = POST_TYPES.get(p.get("type", ""), {}).get("label", p.get("type", ""))
+            preview = p.get("draft", "")[:60] + "…" if len(p.get("draft", "")) > 60 else p.get("draft", "")
+            choices.append(questionary.Choice(f"{i}. {label} — {preview}", value=("edit", i - 1)))
+        choices.append(questionary.Choice("Refine all with AI feedback", value=("refine", None)))
+        choices.append(questionary.Choice("Accept and continue", value=("accept", None)))
+
+        result = questionary.select("Pick a post to edit, or:", choices=choices).ask()
+        if result is None:
+            break
+        action, idx = result
+
+        if action == "accept":
             break
 
-        if not feedback:
-            break
+        if action == "edit":
+            current_draft = posts[idx].get("draft", "")
+            try:
+                edited = pt_prompt("Edit post (Meta+Enter to submit):\n", default=current_draft, multiline=True)
+            except (EOFError, KeyboardInterrupt):
+                continue
+            edited = edited.strip()
+            if edited and edited != current_draft:
+                posts[idx]["draft"] = edited
+                label = POST_TYPES.get(posts[idx].get("type", ""), {}).get("label", posts[idx].get("type", ""))
+                conversation.append({"role": "user", "content": f"I manually edited post '{label}' to: {edited}"})
+                conversation.append({"role": "assistant", "content": json.dumps(posts, indent=2)})
 
-        conversation.append({"role": "user", "content": feedback})
+            console.print()
+            print_posts(posts)
 
-        print(f"\n  Refining ({model})…\n")
-        try:
-            response = client.messages.create(
-                model=model,
-                max_tokens=2000,
-                system=f"""You are refining social media post drafts.
+        elif action == "refine":
+            try:
+                feedback = pt_prompt("Feedback: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                continue
+            if not feedback:
+                continue
+
+            conversation.append({"role": "user", "content": feedback})
+
+            with console.status("Refining…"):
+                try:
+                    response = client.messages.create(
+                        model=model,
+                        max_tokens=2000,
+                        system=f"""You are refining social media post drafts.
 {persona_hint}
 
 You were given a set of posts (as JSON) and the user is giving feedback.
 Apply their feedback and return the updated posts array as valid JSON.
 Keep the same structure: each post has "type", "draft", "source".
 Return ONLY the JSON array, no markdown fences, no preamble.""",
-                messages=conversation,
-            )
-        except anthropic.APIError as e:
-            print(f"\n{BOLD}[error]{RESET} API call failed: {e}")
-            continue
+                        messages=conversation,
+                    )
+                except anthropic.APIError as e:
+                    console.print(f"\n[bold red]\\[error][/bold red] API call failed: {e}")
+                    continue
 
-        raw = response.content[0].text.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-            raw = raw.strip()
+            raw = response.content[0].text.strip()
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+                raw = raw.strip()
 
-        try:
-            posts = json.loads(raw)
-        except json.JSONDecodeError:
-            print(f"  {BOLD}[error]{RESET} Couldn't parse response. Try again.\n")
-            conversation.pop()  # remove failed feedback so conversation stays clean
-            continue
+            try:
+                posts = json.loads(raw)
+            except json.JSONDecodeError:
+                console.print("[bold red]\\[error][/bold red] Couldn't parse response. Try again.\n")
+                conversation.pop()
+                continue
 
-        conversation.append({"role": "assistant", "content": raw})
+            conversation.append({"role": "assistant", "content": raw})
 
-        print_posts(posts)
+            console.print()
+            print_posts(posts)
 
     return posts
 
 
 def save_posts(posts: list[dict], date_str: str, project: str | None = None):
-    """Let user pick which posts to save as individual files."""
-    print(f"\n  {BOLD}Save posts{RESET}")
-    print(f"  {DIM}Enter post numbers to save (e.g. 1 3 5), 'all', or Enter to skip:{RESET}")
-    try:
-        choice = input(f"  {TEAL}>{RESET} ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return
+    """Let user pick which posts to save via checkbox multi-select."""
+    console.print()
+    choices = []
+    for i, post in enumerate(posts):
+        ptype = post.get("type", "post")
+        info = POST_TYPES.get(ptype, {})
+        label = info.get("label", ptype)
+        draft = post.get("draft", "")
+        preview = draft[:60] + "…" if len(draft) > 60 else draft
+        choices.append(questionary.Choice(f"{i + 1}. {label} — {preview}", value=i))
 
-    if not choice:
-        print(f"  {DIM}No posts saved.{RESET}")
-        return
-
-    if choice.lower() == "all":
-        indices = list(range(len(posts)))
-    else:
-        try:
-            indices = [int(x) - 1 for x in choice.split()]
-            indices = [i for i in indices if 0 <= i < len(posts)]
-        except ValueError:
-            print(f"  {AMBER}Couldn't parse selection. No posts saved.{RESET}")
-            return
-
-    if not indices:
-        print(f"  {DIM}No valid posts selected.{RESET}")
+    selected = questionary.checkbox("Save which posts?", choices=choices).ask()
+    if selected is None or not selected:
+        console.print("  [dim]No posts saved.[/dim]")
         return
 
     # Build output dir: posts/ or posts/<project>/
@@ -930,7 +1128,7 @@ def save_posts(posts: list[dict], date_str: str, project: str | None = None):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     saved = []
-    for idx in indices:
+    for idx in selected:
         post = posts[idx]
         ptype = post.get("type", "post")
         draft = post.get("draft", "")
@@ -954,9 +1152,9 @@ def save_posts(posts: list[dict], date_str: str, project: str | None = None):
         saved.append(path)
 
     for p in saved:
-        print(f"  {GREEN}Saved:{RESET} {p}")
+        console.print(f"  [green]Saved:[/green] {p}")
 
-    print(f"\n  {DIM}Edit these files before publishing.{RESET}")
+    console.print("\n  [dim]Edit these files before publishing.[/dim]")
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────────
@@ -970,7 +1168,7 @@ def main():
     parser.add_argument("--to", dest="to_date", help="End date YYYY-MM-DD (default: today)")
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Anthropic model to use (default: {DEFAULT_MODEL})")
     parser.add_argument("--project", nargs="?", const="__pick__", help="Filter by project (shows picker if no name given)")
-    parser.add_argument("--platform", choices=["twitter", "linkedin", "bluesky", "mastodon", "threads"], default=None, help="Target platform (adjusts length and tone)")
+    parser.add_argument("--platform", choices=["twitter", "linkedin", "bluesky", "mastodon", "threads", "blog"], default=None, help="Target platform (adjusts length and tone; 'blog' generates a devlog post)")
     parser.add_argument("--dry-run", action="store_true", help="List sessions found, skip API call")
     parser.add_argument("--no-refine", action="store_true", help="Skip the interactive refinement loop")
     parser.add_argument("--setup", action="store_true", help="Run persona setup (create/overwrite persona.md)")
@@ -983,17 +1181,17 @@ def main():
 
     # Check for API key — prompt setup on first run
     if not _has_api_key():
-        print(f"  {AMBER}No API key found.{RESET}")
+        console.print("  [yellow]No API key found.[/yellow]")
         setup_api_key()
         if not _has_api_key():
-            print(f"\n  {BOLD}[error]{RESET} An Anthropic API key is required.")
-            print(f"  Run {TEAL}cc-ghost --setup{RESET} or set ANTHROPIC_API_KEY in your environment.")
+            console.print("\n  [bold red]\\[error][/bold red] An Anthropic API key is required.")
+            console.print("  Run [cyan]cc-ghost --setup[/cyan] or set ANTHROPIC_API_KEY in your environment.")
             return
 
     # Load persona — prompt setup on first run
     persona = load_persona()
     if not persona:
-        print(f"  {AMBER}No persona found.{RESET} Let's set one up.\n")
+        console.print("  [yellow]No persona found.[/yellow] Let's set one up.\n")
         setup_persona()
         persona = load_persona()
 
@@ -1032,8 +1230,9 @@ def main():
         projects = sorted(project_info.keys())
 
         if args.project == "__pick__":
-            print(f"\n{BOLD}cc-ghost{RESET}  all projects\n")
-            for i, p in enumerate(projects, 1):
+            # Build choices with age labels
+            picker_choices = []
+            for p in projects:
                 last = project_info[p]
                 age = (now - last).days
                 if age == 0:
@@ -1042,33 +1241,20 @@ def main():
                     age_str = "yesterday"
                 else:
                     age_str = f"{age}d ago"
-                print(f"    {TEAL}{i}.{RESET} {p}  {DIM}({age_str}){RESET}")
-            print(f"\n  {DIM}Enter number or name:{RESET}")
-            try:
-                pick = input(f"  {TEAL}>{RESET} ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print()
-                return
-            if pick:
-                try:
-                    idx = int(pick) - 1
-                    if 0 <= idx < len(projects):
-                        selected_project = projects[idx]
-                except ValueError:
-                    matches = [p for p in projects if pick.lower() in p.lower()]
-                    if matches:
-                        selected_project = matches[0]
-                if not selected_project:
-                    print(f"  {AMBER}No matching project found.{RESET}")
-                    return
-            else:
+                picker_choices.append(questionary.Choice(f"{p}  ({age_str})", value=p))
+
+            selected_project = questionary.select(
+                "Pick a project:",
+                choices=picker_choices,
+            ).ask()
+            if selected_project is None:
                 return
         else:
             matches = [p for p in projects if args.project.lower() in p.lower()]
             if matches:
                 selected_project = matches[0]
             else:
-                print(f"  {AMBER}No project matching '{args.project}' found.{RESET}")
+                console.print(f"  [yellow]No project matching '{args.project}' found.[/yellow]")
                 return
 
         project_folders = project_folders_map.get(selected_project)
@@ -1095,13 +1281,13 @@ def main():
     else:
         to_dt = now
 
-    print(f"\n{BOLD}cc-ghost{RESET}  scanning {CLAUDE_PROJECTS_DIR}")
+    console.print(f"\n[bold]cc-ghost[/bold]  scanning {CLAUDE_PROJECTS_DIR}")
     if selected_project:
-        print(f"  {BOLD}Project:{RESET} {selected_project}")
+        console.print(f"  [bold]Project:[/bold] {selected_project}")
     if from_dt.year > 1:
         since = " (since last run)" if used_last_run else ""
-        print(f"  Range: {from_dt.strftime('%Y-%m-%d %H:%M')}{since} → {to_dt.strftime('%Y-%m-%d %H:%M')}")
-    print()
+        console.print(f"  Range: {from_dt.strftime('%Y-%m-%d %H:%M')}{since} → {to_dt.strftime('%Y-%m-%d %H:%M')}")
+    console.print()
 
     sessions = load_sessions(from_dt, to_dt, project_folders=project_folders)
 
@@ -1110,46 +1296,58 @@ def main():
 
     if not sessions:
         msg = f"No sessions found for '{selected_project}'" if selected_project else "No sessions found"
-        print(f"{msg}.")
+        console.print(f"{msg}.")
         if not selected_project:
-            print(f"Tip: check that {CLAUDE_PROJECTS_DIR} contains .jsonl files.")
+            console.print(f"Tip: check that {CLAUDE_PROJECTS_DIR} contains .jsonl files.")
         return
 
     # Local overview — always shown, even on dry-run
     print_overview(sessions)
 
     if args.dry_run:
-        print("[dry-run] Skipping API call.")
+        console.print("\\[dry-run] Skipping API call.")
         return
 
     # Load past posts for context
     past_posts = load_past_posts()
     if past_posts:
-        print(f"  {DIM}Loaded {len(past_posts)} published post(s) as style reference.{RESET}")
+        console.print(f"  [dim]Loaded {len(past_posts)} published post(s) as style reference.[/dim]")
 
     # Load git commit history for each project
     git_logs = load_git_logs(sessions, from_dt)
     if git_logs:
         total = sum(len(c) for c in git_logs.values())
-        print(f"  {DIM}Loaded {total} git commit(s) from {len(git_logs)} project(s).{RESET}")
+        console.print(f"  [dim]Loaded {total} git commit(s) from {len(git_logs)} project(s).[/dim]")
 
-    print()
-    posts = generate_posts(sessions, model=args.model, persona=persona, past_posts=past_posts, git_logs=git_logs, platform=args.platform)
-    save_last_run(now)
+    console.print()
 
-    plat_label = f"  ·  {args.platform}" if args.platform else ""
-    print(f"\n{BOLD}{'─' * 60}{RESET}")
-    print(f"{BOLD}  Suggested posts{plat_label}{RESET}")
-    print(f"{BOLD}{'─' * 60}{RESET}\n")
+    if args.platform == "blog":
+        # Blog post flow
+        blog = generate_blog(sessions, model=args.model, persona=persona, past_posts=past_posts, git_logs=git_logs)
+        save_last_run(now)
 
-    print_posts(posts)
+        console.rule("[bold]Devlog[/bold]")
+        print_blog(blog)
 
-    # Interactive refinement
-    if not args.no_refine:
-        posts = refine_posts(posts, model=args.model, persona=persona)
+        if not args.no_refine:
+            blog = refine_blog(blog, model=args.model, persona=persona)
 
-    # Save individual posts
-    save_posts(posts, now.strftime("%Y-%m-%d"), project=selected_project)
+        save_blog(blog, now.strftime("%Y-%m-%d"), project=selected_project)
+    else:
+        # Social posts flow
+        posts = generate_posts(sessions, model=args.model, persona=persona, past_posts=past_posts, git_logs=git_logs, platform=args.platform)
+        save_last_run(now)
+
+        plat_label = f"  ·  {args.platform}" if args.platform else ""
+        console.rule(f"[bold]Suggested posts{plat_label}[/bold]")
+        console.print()
+
+        print_posts(posts)
+
+        if not args.no_refine:
+            posts = refine_posts(posts, model=args.model, persona=persona)
+
+        save_posts(posts, now.strftime("%Y-%m-%d"), project=selected_project)
 
 
 if __name__ == "__main__":

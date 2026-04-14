@@ -12,6 +12,8 @@ requires-python = ">=3.11"
 dependencies = [
     "anthropic",
     "python-dotenv",
+    "rich",
+    "questionary",
 ]
 
 [project.scripts]

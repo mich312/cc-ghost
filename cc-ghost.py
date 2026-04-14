@@ -4,6 +4,8 @@
 # dependencies = [
 #     "anthropic",
 #     "python-dotenv",
+#     "rich",
+#     "questionary",
 # ]
 # ///
 """Thin wrapper for `uv run cc-ghost.py` compatibility."""
