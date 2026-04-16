@@ -628,7 +628,8 @@ def _format_sessions_for_prompt(sessions: list[dict], persona: str, past_posts: 
 
 def build_post_prompt(sessions: list[dict], persona: str, past_posts: list[str],
                       git_logs: dict[str, list[str]] | None = None,
-                      platform: str | None = None) -> str:
+                      platform: str | None = None,
+                      angle: str | None = None) -> str:
     """Build a prompt that asks ONLY for post drafts (no summary/digest)."""
     ctx = _format_sessions_for_prompt(sessions, persona, past_posts, git_logs)
 
@@ -638,12 +639,16 @@ def build_post_prompt(sessions: list[dict], persona: str, past_posts: list[str],
     platform_tone = plat.get("tone", "")
     platform_instruction = f"\nTARGET PLATFORM: {platform}\nTone: {platform_tone}" if platform else ""
 
+    angle_instruction = ""
+    if angle:
+        angle_instruction = f"\nFOCUS/ANGLE: {angle}\nAll posts should be focused on this topic — different post TYPES (build-update, lesson, etc.) but all about this angle. Skip session content not relevant to it.\n"
+
     return f"""You are a social media ghostwriter.
 Read these Claude Code sessions and generate post drafts.
 
 {ctx["persona_section"]}
 {ctx["past_section"]}{platform_instruction}
-DATE RANGE: {ctx["date_range"]}
+{angle_instruction}DATE RANGE: {ctx["date_range"]}
 TOTAL SESSIONS: {ctx["session_count"]}
 
 EFFORT METRICS (use naturally in posts where relevant — don't force it):
@@ -681,10 +686,11 @@ Return ONLY the JSON array, no markdown fences, no preamble.
 
 
 def generate_posts(sessions: list[dict], model: str, persona: str, past_posts: list[str],
-                    git_logs: dict[str, list[str]] | None = None, platform: str | None = None) -> list[dict]:
+                    git_logs: dict[str, list[str]] | None = None, platform: str | None = None,
+                    angle: str | None = None) -> list[dict]:
     """Call Claude API to generate post drafts. Returns a list of post dicts."""
     client = anthropic.Anthropic()
-    prompt = build_post_prompt(sessions, persona, past_posts, git_logs=git_logs, platform=platform)
+    prompt = build_post_prompt(sessions, persona, past_posts, git_logs=git_logs, platform=platform, angle=angle)
 
     with console.status(f"Calling Claude API ({model})…"):
         try:
@@ -727,13 +733,15 @@ def generate_posts(sessions: list[dict], model: str, persona: str, past_posts: l
 
 # ── Blog ─────────────────────────────────────────────────────────────────────
 
-def suggest_blog_angles(sessions: list[dict], persona: str, git_logs: dict[str, list[str]] | None = None,
-                        model: str = DEFAULT_MODEL) -> list[dict]:
-    """Ask the AI for blog angle suggestions based on sessions. Returns list of {title, description, scope}."""
+def suggest_angles(sessions: list[dict], persona: str, git_logs: dict[str, list[str]] | None = None,
+                   model: str = DEFAULT_MODEL) -> list[dict]:
+    """Ask the AI for post angle suggestions based on sessions. Returns list of {title, description, scope}."""
     ctx = _format_sessions_for_prompt(sessions, persona, [], git_logs)
 
-    prompt = f"""Look at these Claude Code sessions and suggest 4-5 possible blog post angles.
+    prompt = f"""Look at these Claude Code sessions and suggest 4-5 possible post angles.
 Vary the scope from broad to narrow based on what the sessions contain.
+The angle will be used to focus a post (could be a tweet, blog, etc.) — so it should be
+a concrete topic or theme, not a format/medium.
 
 {ctx["persona_section"]}
 DATE RANGE: {ctx["date_range"]}
@@ -748,7 +756,7 @@ SESSION LOG:
 ---
 
 Return a JSON array. Each entry has:
-- "title": a compelling blog post title (specific, not generic)
+- "title": a compelling, specific topic title (not generic)
 - "description": one sentence explaining the angle and what it would cover
 - "scope": "broad", "medium", or "narrow"
 
@@ -933,8 +941,8 @@ Return ONLY the markdown content, no wrapping fences, no preamble.""",
     return blog
 
 
-def save_blog(blog: str, date_str: str, project: str | None = None):
-    """Save blog post as a markdown file."""
+def save_blog(blog: str, date_str: str, project: str | None = None) -> Path:
+    """Save blog post as a markdown file and return the path."""
     out_dir = POSTS_DIR / project if project else POSTS_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -945,13 +953,8 @@ def save_blog(blog: str, date_str: str, project: str | None = None):
         path = out_dir / f"{date_str}-blog-{counter}.md"
         counter += 1
 
-    save = questionary.confirm(f"Save blog post to {path}?", default=True).ask()
-    if save is None or not save:
-        console.print("  [dim]Blog post not saved.[/dim]")
-        return
-
     path.write_text(blog + "\n", encoding="utf-8")
-    console.print(f"  [green]Saved:[/green] {path}")
+    return path
 
 
 # ── Output ──────────────────────────────────────────────────────────────────────
@@ -1071,49 +1074,57 @@ def print_posts(posts: list[dict]):
         console.print(panel)
 
 
-def refine_posts(posts: list[dict], model: str, persona: str) -> list[dict]:
-    """Interactive loop: edit directly, refine with AI, or accept."""
+def pick_post(posts: list[dict]) -> dict | None:
+    """Let user pick one post to keep working on. Returns the chosen post or None."""
+    if len(posts) == 1:
+        return posts[0]
+
+    choices = []
+    for i, p in enumerate(posts, 1):
+        label = POST_TYPES.get(p.get("type", ""), {}).get("label", p.get("type", ""))
+        preview = p.get("draft", "")[:60] + "…" if len(p.get("draft", "")) > 60 else p.get("draft", "")
+        choices.append(questionary.Choice(f"{i}. {label} — {preview}", value=i - 1))
+
+    idx = questionary.select("Which post do you want to keep?", choices=choices).ask()
+    if idx is None:
+        return None
+    return posts[idx]
+
+
+def refine_single_post(post: dict, model: str, persona: str) -> dict:
+    """Interactive loop for refining a single post."""
     client = anthropic.Anthropic()
     conversation = [
-        {"role": "assistant", "content": json.dumps(posts, indent=2)},
+        {"role": "assistant", "content": json.dumps(post, indent=2)},
     ]
 
     persona_hint = f"\n\nPERSONA:\n{persona}" if persona else ""
 
     while True:
-        # Build choices: accept and refine first, then individual posts
-        choices = [
-            questionary.Choice("Accept and continue", value=("accept", None)),
-            questionary.Choice("Refine all with AI feedback", value=("refine", None)),
-        ]
-        for i, p in enumerate(posts, 1):
-            label = POST_TYPES.get(p.get("type", ""), {}).get("label", p.get("type", ""))
-            preview = p.get("draft", "")[:60] + "…" if len(p.get("draft", "")) > 60 else p.get("draft", "")
-            choices.append(questionary.Choice(f"Edit {i}. {label} — {preview}", value=("edit", i - 1)))
-
-        result = questionary.select("What next?", choices=choices).ask()
-        if result is None:
-            break
-        action, idx = result
-
-        if action == "accept":
+        action = questionary.select(
+            "What next?",
+            choices=[
+                questionary.Choice("Accept and save", value="accept"),
+                questionary.Choice("Refine with AI feedback", value="refine"),
+                questionary.Choice("Edit directly", value="edit"),
+            ],
+        ).ask()
+        if action is None or action == "accept":
             break
 
         if action == "edit":
-            current_draft = posts[idx].get("draft", "")
+            current_draft = post.get("draft", "")
             try:
                 edited = pt_prompt("Edit post (Meta+Enter to submit):\n", default=current_draft, multiline=True)
             except (EOFError, KeyboardInterrupt):
                 continue
             edited = edited.strip()
             if edited and edited != current_draft:
-                posts[idx]["draft"] = edited
-                label = POST_TYPES.get(posts[idx].get("type", ""), {}).get("label", posts[idx].get("type", ""))
-                conversation.append({"role": "user", "content": f"I manually edited post '{label}' to: {edited}"})
-                conversation.append({"role": "assistant", "content": json.dumps(posts, indent=2)})
-
+                post["draft"] = edited
+                conversation.append({"role": "user", "content": f"I manually edited the post to: {edited}"})
+                conversation.append({"role": "assistant", "content": json.dumps(post, indent=2)})
             console.print()
-            print_posts(posts)
+            print_posts([post])
 
         elif action == "refine":
             try:
@@ -1130,13 +1141,13 @@ def refine_posts(posts: list[dict], model: str, persona: str) -> list[dict]:
                     response = client.messages.create(
                         model=model,
                         max_tokens=2000,
-                        system=f"""You are refining social media post drafts.
+                        system=f"""You are refining a single social media post draft.
 {persona_hint}
 
-You were given a set of posts (as JSON) and the user is giving feedback.
-Apply their feedback and return the updated posts array as valid JSON.
-Keep the same structure: each post has "type", "draft", "source".
-Return ONLY the JSON array, no markdown fences, no preamble.""",
+You were given a post (as JSON) and the user is giving feedback.
+Apply their feedback and return the updated post as a valid JSON OBJECT (not array).
+Keep the same structure: "type", "draft", "source".
+Return ONLY the JSON object, no markdown fences, no preamble.""",
                         messages=conversation,
                     )
                 except anthropic.APIError as e:
@@ -1151,8 +1162,15 @@ Return ONLY the JSON array, no markdown fences, no preamble.""",
                 raw = raw.strip()
 
             try:
-                posts = json.loads(raw)
-            except json.JSONDecodeError:
+                parsed = json.loads(raw)
+                # Tolerate the model returning an array even though we asked for an object
+                if isinstance(parsed, list) and parsed:
+                    parsed = parsed[0]
+                if isinstance(parsed, dict):
+                    post = parsed
+                else:
+                    raise ValueError("not a dict")
+            except (json.JSONDecodeError, ValueError):
                 console.print("[bold red]\\[error][/bold red] Couldn't parse response. Try again.\n")
                 conversation.pop()
                 continue
@@ -1160,60 +1178,33 @@ Return ONLY the JSON array, no markdown fences, no preamble.""",
             conversation.append({"role": "assistant", "content": raw})
 
             console.print()
-            print_posts(posts)
+            print_posts([post])
 
-    return posts
+    return post
 
 
-def save_posts(posts: list[dict], date_str: str, project: str | None = None):
-    """Let user pick which posts to save via checkbox multi-select."""
-    console.print()
-    choices = []
-    for i, post in enumerate(posts):
-        ptype = post.get("type", "post")
-        info = POST_TYPES.get(ptype, {})
-        label = info.get("label", ptype)
-        draft = post.get("draft", "")
-        preview = draft[:60] + "…" if len(draft) > 60 else draft
-        choices.append(questionary.Choice(f"{i + 1}. {label} — {preview}", value=i))
-
-    selected = questionary.checkbox("Save which posts?", choices=choices).ask()
-    if selected is None or not selected:
-        console.print("  [dim]No posts saved.[/dim]")
-        return
-
-    # Build output dir: posts/ or posts/<project>/
+def save_single_post(post: dict, date_str: str, project: str | None = None) -> Path | None:
+    """Save a single post to disk and return the path."""
     out_dir = POSTS_DIR / project if project else POSTS_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    saved = []
-    for idx in selected:
-        post = posts[idx]
-        ptype = post.get("type", "post")
-        draft = post.get("draft", "")
-        source = post.get("source", "")
-        info = POST_TYPES.get(ptype, {})
-        label = info.get("label", ptype)
+    ptype = post.get("type", "post")
+    draft = post.get("draft", "")
+    source = post.get("source", "")
+    info = POST_TYPES.get(ptype, {})
+    label = info.get("label", ptype)
 
-        # Filename: 2026-04-12-build-update.md
-        slug = ptype.replace(" ", "-").lower()
-        filename = f"{date_str}-{slug}.md"
+    slug = ptype.replace(" ", "-").lower()
+    filename = f"{date_str}-{slug}.md"
+    path = out_dir / filename
+    counter = 2
+    while path.exists():
+        path = out_dir / f"{date_str}-{slug}-{counter}.md"
+        counter += 1
 
-        # Avoid overwriting — append a number if needed
-        path = out_dir / filename
-        counter = 2
-        while path.exists():
-            path = out_dir / f"{date_str}-{slug}-{counter}.md"
-            counter += 1
-
-        content = f"# {label}\n\n{draft}\n\n---\n*{source}*\n"
-        path.write_text(content, encoding="utf-8")
-        saved.append(path)
-
-    for p in saved:
-        console.print(f"  [green]Saved:[/green] {p}")
-
-    console.print("\n  [dim]Edit these files before publishing.[/dim]")
+    content = f"# {label}\n\n{draft}\n\n---\n*{source}*\n"
+    path.write_text(content, encoding="utf-8")
+    return path
 
 
 # ── CLI ─────────────────────────────────────────────────────────────────────────
@@ -1395,67 +1386,64 @@ def main():
         if platform is None:
             return
 
+    # ── Pick projects (skip if already filtered by --project) ────────────
+    chosen_sessions = sessions
+    if not selected_project:
+        projects_in_range: dict[str, int] = defaultdict(int)
+        for s in sessions:
+            projects_in_range[s["project"]] += 1
+        if len(projects_in_range) > 1:
+            proj_choices = [
+                questionary.Choice(
+                    f"{name} ({count} sessions)",
+                    value=name,
+                    checked=True,
+                )
+                for name, count in sorted(projects_in_range.items(), key=lambda x: -x[1])
+            ]
+            selected_projects = questionary.checkbox(
+                "Which projects to include?",
+                choices=proj_choices,
+            ).ask()
+            if selected_projects is None:
+                return
+            if selected_projects:
+                chosen_sessions = [s for s in sessions if s["project"] in selected_projects]
+            if not chosen_sessions:
+                console.print("  [dim]No sessions selected.[/dim]")
+                return
+
+    # ── Pick angle ────────────────────────────────────────────────────────
+    chosen_git_logs = {k: v for k, v in git_logs.items()
+                       if any(s["project"] == k for s in chosen_sessions)} if git_logs else None
+    angles = suggest_angles(chosen_sessions, persona, git_logs=chosen_git_logs, model=args.model)
+
+    angle = None
+    if angles:
+        angle_choices = []
+        for a in angles:
+            scope = a.get("scope", "")
+            title = a.get("title", "")
+            desc = a.get("description", "")
+            angle_choices.append(questionary.Choice(f"[{scope}] {title} — {desc}", value=title))
+        angle_choices.append(questionary.Choice("Write my own angle…", value="__custom__"))
+        angle_choices.append(questionary.Choice("No focus — use everything", value="__none__"))
+
+        picked = questionary.select("Pick a topic/angle:", choices=angle_choices).ask()
+        if picked is None:
+            return
+        if picked == "__custom__":
+            try:
+                angle = pt_prompt("Topic/angle: ").strip() or None
+            except (EOFError, KeyboardInterrupt):
+                return
+        elif picked != "__none__":
+            angle = picked
+
     # ── Generate ──────────────────────────────────────────────────────────
     if platform == "blog":
-        # Blog flow: pick projects → pick angle → generate
-
-        # Narrow projects (skip if already filtered by --project)
-        blog_sessions = sessions
-        if not selected_project:
-            projects_in_range: dict[str, int] = defaultdict(int)
-            for s in sessions:
-                projects_in_range[s["project"]] += 1
-            if len(projects_in_range) > 1:
-                proj_choices = [
-                    questionary.Choice(
-                        f"{name} ({count} sessions)",
-                        value=name,
-                        checked=True,
-                    )
-                    for name, count in sorted(projects_in_range.items(), key=lambda x: -x[1])
-                ]
-                selected_projects = questionary.checkbox(
-                    "Which projects to include?",
-                    choices=proj_choices,
-                ).ask()
-                if selected_projects is None:
-                    return
-                if selected_projects:
-                    blog_sessions = [s for s in sessions if s["project"] in selected_projects]
-                if not blog_sessions:
-                    console.print("  [dim]No sessions selected.[/dim]")
-                    return
-
-        # Suggest angles
-        blog_git_logs = {k: v for k, v in git_logs.items()
-                         if any(s["project"] == k for s in blog_sessions)} if git_logs else None
-        angles = suggest_blog_angles(blog_sessions, persona, git_logs=blog_git_logs, model=args.model)
-
-        angle = None
-        if angles:
-            angle_choices = []
-            for a in angles:
-                scope = a.get("scope", "")
-                title = a.get("title", "")
-                desc = a.get("description", "")
-                angle_choices.append(questionary.Choice(f"[{scope}] {title} — {desc}", value=title))
-            angle_choices.append(questionary.Choice("Write my own angle…", value="__custom__"))
-            angle_choices.append(questionary.Choice("No focus — use everything", value="__none__"))
-
-            picked = questionary.select("Pick a blog angle:", choices=angle_choices).ask()
-            if picked is None:
-                return
-            if picked == "__custom__":
-                try:
-                    angle = pt_prompt("Blog angle/focus: ").strip() or None
-                except (EOFError, KeyboardInterrupt):
-                    return
-            elif picked != "__none__":
-                angle = picked
-
-        # Generate
-        blog = generate_blog(blog_sessions, model=args.model, persona=persona,
-                             past_posts=past_posts, git_logs=blog_git_logs, angle=angle)
+        blog = generate_blog(chosen_sessions, model=args.model, persona=persona,
+                             past_posts=past_posts, git_logs=chosen_git_logs, angle=angle)
         save_last_run(now)
 
         console.rule("[bold]Devlog[/bold]")
@@ -1464,22 +1452,34 @@ def main():
         if not args.no_refine:
             blog = refine_blog(blog, model=args.model, persona=persona)
 
-        save_blog(blog, now.strftime("%Y-%m-%d"), project=selected_project)
+        path = save_blog(blog, now.strftime("%Y-%m-%d"), project=selected_project)
+        console.rule("[bold green]Final post[/bold green]")
+        print_blog(blog)
+        console.print(f"  [green]Saved:[/green] {path}\n")
     else:
-        # Social posts flow
-        posts = generate_posts(sessions, model=args.model, persona=persona,
-                               past_posts=past_posts, git_logs=git_logs, platform=platform)
+        posts = generate_posts(chosen_sessions, model=args.model, persona=persona,
+                               past_posts=past_posts, git_logs=chosen_git_logs,
+                               platform=platform, angle=angle)
         save_last_run(now)
 
-        console.rule(f"[bold]Suggested posts  ·  {platform}[/bold]")
+        console.rule(f"[bold]Drafts  ·  {platform}[/bold]")
         console.print()
-
         print_posts(posts)
 
-        if not args.no_refine:
-            posts = refine_posts(posts, model=args.model, persona=persona)
+        post = pick_post(posts)
+        if post is None:
+            return
 
-        save_posts(posts, now.strftime("%Y-%m-%d"), project=selected_project)
+        console.print()
+        print_posts([post])
+
+        if not args.no_refine:
+            post = refine_single_post(post, model=args.model, persona=persona)
+
+        path = save_single_post(post, now.strftime("%Y-%m-%d"), project=selected_project)
+        console.rule("[bold green]Final post[/bold green]")
+        print_posts([post])
+        console.print(f"  [green]Saved:[/green] {path}\n")
 
 
 if __name__ == "__main__":

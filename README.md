@@ -40,6 +40,7 @@ cc-ghost --days 14                          # last 14 days
 cc-ghost --project                          # pick a project (loads all sessions)
 cc-ghost --project MyApp                    # filter by name
 cc-ghost --platform twitter                 # optimize for Twitter (280 chars)
+cc-ghost --platform blog                    # write a long-form devlog post
 cc-ghost --dry-run                          # preview sessions, no API call
 cc-ghost --setup                            # configure API key and persona
 cc-ghost --model claude-sonnet-4-5          # override model
@@ -48,25 +49,31 @@ cc-ghost --no-refine                        # skip interactive refinement
 
 ### Project picker
 
-`--project` without a value shows all your projects with last-activity dates:
+`--project` without a value shows an arrow-key picker with last-activity dates:
 
 ```
-cc-ghost  all projects
-
-    1. MyApp           (today)
-    2. SideProject     (23d ago)
-    3. OldThing        (81d ago)
-    4. WeekendHack     (yesterday)
-
-  Enter number or name:
-  >
+? Pick a project: (Use arrow keys)
+ ❯ MyApp           (today)
+   SideProject     (23d ago)
+   OldThing        (81d ago)
+   WeekendHack     (yesterday)
 ```
 
 When picking a project without `--days` or `--from`, all sessions for that project are loaded regardless of date.
 
 ### Platform targeting
 
-Use `--platform` to tailor posts for a specific platform:
+If `--platform` is omitted, cc-ghost asks where you want to post:
+
+```
+? Where do you want to post? (Use arrow keys)
+ ❯ Twitter  (280 chars, punchy)
+   Bluesky  (300 chars, casual)
+   Mastodon (500 chars, technical)
+   Threads  (500 chars, brief)
+   LinkedIn (3000 chars, professional)
+   Blog post (long-form devlog)
+```
 
 | Platform | Char limit | Tone |
 |---|---|---|
@@ -75,31 +82,46 @@ Use `--platform` to tailor posts for a specific platform:
 | `mastodon` | 500 | Casual, technical depth welcome |
 | `threads` | 500 | Brief, conversation-starting |
 | `linkedin` | 3000 | Professional but authentic |
+| `blog` | — | Long-form devlog with markdown headings |
 
-Without `--platform`, posts default to 500 characters with no platform-specific tone.
+### Blog post flow
+
+Blog generation has two extra steps before drafting:
+
+1. **Project checkbox** — pick which projects' sessions to include (skipped if `--project` was used)
+2. **Angle picker** — the AI suggests 4-5 possible angles ranging from broad (weekly recap) to narrow (deep-dive on one feature). Pick one, write your own, or skip for an unfocused post.
+
+The result is a single markdown file you can edit and publish.
 
 ### Refinement loop
 
-After generating posts, you can give feedback to adjust them:
+After generating posts, choose what to do next:
 
 ```
-  Give feedback to refine, or press Enter to accept:
-  > make the recap shorter
-  > add something about the caching fix
-  > drop post 3
-  >
+? What next? (Use arrow keys)
+ ❯ Accept and continue
+   Refine all with AI feedback
+   Edit 1. Build update — Shipped the new share card pipeline today…
+   Edit 2. Lesson — Realized I was over-engineering the caching layer…
+   Edit 3. Engagement — How do you handle migrations that touch…
 ```
+
+- **Accept** — keep the posts as-is and move to saving.
+- **Refine** — type natural-language feedback ("make the recap shorter"), AI rewrites all posts.
+- **Edit a specific post** — opens the draft in an inline editor (Meta+Enter to submit).
+
+For blog posts, "Edit directly" opens the full markdown in the editor.
 
 ### Saving posts
 
-After refinement, choose which posts to save:
+After refinement, pick which posts to save with a checkbox:
 
 ```
-  Save posts
-  Enter post numbers to save (e.g. 1 3 5), 'all', or Enter to skip:
-  > 1 4
-  Saved: ~/.config/cc-ghost/posts/MyApp/2026-04-12-build-update.md
-  Saved: ~/.config/cc-ghost/posts/MyApp/2026-04-12-weekly-recap.md
+? Save which posts? (use arrow keys, space to toggle, enter to confirm)
+ ❯ ◉ 1. Build update — Shipped the new share card pipeline today…
+   ◯ 2. Lesson — Realized I was over-engineering the caching layer…
+   ◉ 3. Engagement — How do you handle migrations that touch…
+   ◉ 4. Weekly recap — A quiet week, but a productive one…
 ```
 
 Posts are saved as individual markdown files in `~/.config/cc-ghost/posts/`. Edit them before publishing.
@@ -110,9 +132,10 @@ Posts are saved as individual markdown files in `~/.config/cc-ghost/posts/`. Edi
 2. Loads **published posts** from `posts/` as style examples — the ghostwriter matches your real voice, not just the persona description
 3. Scans `~/.claude/projects/` for session logs, session indexes, and session memory summaries
 4. Shows a **local overview** — projects, session counts, activity chart (no API call)
-5. Loads **git commit history** from each project for technical specifics
-6. Sends everything to the Claude API with **effort metrics** (session count, duration, messages per project)
-7. **Refine** interactively, then **save** the ones you want
+5. Asks **where you want to post** (or uses `--platform`)
+6. Loads **git commit history** from each project for technical specifics
+7. Sends everything to the Claude API with **effort metrics** (session count, duration, messages per project)
+8. **Refine** interactively (edit individual posts or rewrite all with feedback), then **save** the ones you want
 
 ### Smart date ranges
 
@@ -141,7 +164,7 @@ Sessions are deduplicated by UUID and the richest available data source is prefe
 
 ## Post types
 
-Posts are chosen dynamically based on what your sessions actually contain:
+For social platforms, posts are chosen dynamically based on what your sessions actually contain (blog mode generates a single long-form post instead):
 
 | Type | Recommended frequency |
 |---|---|
@@ -168,7 +191,7 @@ All config lives in `~/.config/cc-ghost/` (or `$XDG_CONFIG_HOME/cc-ghost/`):
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `ANTHROPIC_API_KEY` | Yes | — | Your Anthropic API key |
-| `CC_GHOST_MODEL` | No | `claude-haiku-4-5-20251001` | Model to use |
+| `CC_GHOST_MODEL` | No | `claude-sonnet-4-5` | Model to use |
 
 The `--model` flag overrides `CC_GHOST_MODEL`. Variables can be set in `~/.config/cc-ghost/config.env`, a `.env` file in the current directory, or your shell environment.
 
