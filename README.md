@@ -38,7 +38,7 @@ uv run cc-ghost.py
 cc-ghost                                    # since last run (or last 7 days)
 cc-ghost --days 14                          # last 14 days
 cc-ghost --project                          # pick a project (loads all sessions)
-cc-ghost --project Mountain                 # filter by name
+cc-ghost --project MyApp                    # filter by name
 cc-ghost --platform twitter                 # optimize for Twitter (280 chars)
 cc-ghost --dry-run                          # preview sessions, no API call
 cc-ghost --setup                            # configure API key and persona
@@ -53,10 +53,10 @@ cc-ghost --no-refine                        # skip interactive refinement
 ```
 cc-ghost  all projects
 
-    1. Customer-Support-Agent  (today)
-    2. DiskBuddy  (23d ago)
-    3. Film-Tracker  (81d ago)
-    4. Mountain-Passes  (yesterday)
+    1. MyApp           (today)
+    2. SideProject     (23d ago)
+    3. OldThing        (81d ago)
+    4. WeekendHack     (yesterday)
 
   Enter number or name:
   >
@@ -85,7 +85,7 @@ After generating posts, you can give feedback to adjust them:
 ```
   Give feedback to refine, or press Enter to accept:
   > make the recap shorter
-  > add something about the MapKit workaround
+  > add something about the caching fix
   > drop post 3
   >
 ```
@@ -98,8 +98,8 @@ After refinement, choose which posts to save:
   Save posts
   Enter post numbers to save (e.g. 1 3 5), 'all', or Enter to skip:
   > 1 4
-  Saved: ~/.config/cc-ghost/posts/Mountain-Passes/2026-04-12-build-update.md
-  Saved: ~/.config/cc-ghost/posts/Mountain-Passes/2026-04-12-weekly-recap.md
+  Saved: ~/.config/cc-ghost/posts/MyApp/2026-04-12-build-update.md
+  Saved: ~/.config/cc-ghost/posts/MyApp/2026-04-12-weekly-recap.md
 ```
 
 Posts are saved as individual markdown files in `~/.config/cc-ghost/posts/`. Edit them before publishing.

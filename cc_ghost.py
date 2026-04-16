@@ -235,7 +235,7 @@ def load_past_posts(limit: int = PAST_POSTS_LIMIT) -> list[str]:
 
 def _project_name_from_folder(folder_name: str) -> str:
     """Derive a readable project name from a Claude projects folder name.
-    e.g. '-Users-michael-Documents-Development-XCode-DiskBuddy' → 'DiskBuddy'
+    e.g. '-Users-alex-Documents-Development-XCode-MyApp' → 'MyApp'
     """
     parts = folder_name.lstrip("-").split("-")
     # Common path segments that aren't the project name

@@ -13,7 +13,7 @@ Installable as a CLI tool via `uv tool install` or runnable directly via `uv run
 ```bash
 cc-ghost                              # since last run (or last 7 days)
 cc-ghost --project                    # pick a project (all sessions)
-cc-ghost --project Mountain           # filter by name substring
+cc-ghost --project MyApp              # filter by name substring
 cc-ghost --days 14                    # last 14 days
 cc-ghost --platform twitter           # optimize for Twitter (280 chars)
 cc-ghost --dry-run                    # list sessions, skip API call
