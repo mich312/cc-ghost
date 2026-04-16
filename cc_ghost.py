@@ -55,7 +55,7 @@ LAST_RUN_PATH = CONFIG_DIR / ".last_run"
 load_dotenv(CONFIG_ENV_PATH)
 load_dotenv()  # also check cwd/.env
 
-DEFAULT_MODEL = os.getenv("CC_GHOST_MODEL", "claude-haiku-4-5-20251001")
+DEFAULT_MODEL = os.getenv("CC_GHOST_MODEL", "claude-sonnet-4-5")
 
 # How many user messages to sample per session (keeps tokens low)
 SAMPLE_MESSAGES_PER_SESSION = 12
@@ -727,10 +727,68 @@ def generate_posts(sessions: list[dict], model: str, persona: str, past_posts: l
 
 # ── Blog ─────────────────────────────────────────────────────────────────────
 
+def suggest_blog_angles(sessions: list[dict], persona: str, git_logs: dict[str, list[str]] | None = None,
+                        model: str = DEFAULT_MODEL) -> list[dict]:
+    """Ask the AI for blog angle suggestions based on sessions. Returns list of {title, description, scope}."""
+    ctx = _format_sessions_for_prompt(sessions, persona, [], git_logs)
+
+    prompt = f"""Look at these Claude Code sessions and suggest 4-5 possible blog post angles.
+Vary the scope from broad to narrow based on what the sessions contain.
+
+{ctx["persona_section"]}
+DATE RANGE: {ctx["date_range"]}
+TOTAL SESSIONS: {ctx["session_count"]}
+
+EFFORT METRICS:
+{ctx["effort"]}
+
+SESSION LOG:
+{ctx["sessions_text"]}
+{ctx["git_section"]}
+---
+
+Return a JSON array. Each entry has:
+- "title": a compelling blog post title (specific, not generic)
+- "description": one sentence explaining the angle and what it would cover
+- "scope": "broad", "medium", or "narrow"
+
+Order from broadest to narrowest.
+Return ONLY the JSON array, no markdown fences, no preamble."""
+
+    client = anthropic.Anthropic()
+    with console.status("Analyzing sessions for blog angles…"):
+        try:
+            response = client.messages.create(
+                model=model,
+                max_tokens=1000,
+                messages=[{"role": "user", "content": prompt}],
+            )
+        except anthropic.APIError as e:
+            console.print(f"\n[bold red]\\[error][/bold red] API call failed: {e}")
+            return []
+
+    raw = response.content[0].text.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+
+
 def build_blog_prompt(sessions: list[dict], persona: str, past_posts: list[str],
-                      git_logs: dict[str, list[str]] | None = None) -> str:
+                      git_logs: dict[str, list[str]] | None = None,
+                      angle: str | None = None) -> str:
     """Build a prompt for generating a long-form devlog blog post."""
     ctx = _format_sessions_for_prompt(sessions, persona, past_posts, git_logs)
+
+    angle_instruction = ""
+    if angle:
+        angle_instruction = f"\nFOCUS/ANGLE: {angle}\nWrite the post through this lens. Use sessions relevant to this angle and skip ones that aren't.\n"
 
     return f"""You are a technical blog ghostwriter.
 Read these Claude Code sessions and write a single devlog blog post.
@@ -739,7 +797,7 @@ Read these Claude Code sessions and write a single devlog blog post.
 {ctx["past_section"]}
 DATE RANGE: {ctx["date_range"]}
 TOTAL SESSIONS: {ctx["session_count"]}
-
+{angle_instruction}
 EFFORT METRICS (weave in naturally — don't list them robotically):
 {ctx["effort"]}
 
@@ -764,10 +822,10 @@ Write a devlog blog post in markdown. Guidelines:
 
 
 def generate_blog(sessions: list[dict], model: str, persona: str, past_posts: list[str],
-                   git_logs: dict[str, list[str]] | None = None) -> str:
+                   git_logs: dict[str, list[str]] | None = None, angle: str | None = None) -> str:
     """Call Claude API to generate a blog post. Returns markdown string."""
     client = anthropic.Anthropic()
-    prompt = build_blog_prompt(sessions, persona, past_posts, git_logs=git_logs)
+    prompt = build_blog_prompt(sessions, persona, past_posts, git_logs=git_logs, angle=angle)
 
     with console.status(f"Generating blog post ({model})…"):
         try:
@@ -1023,16 +1081,17 @@ def refine_posts(posts: list[dict], model: str, persona: str) -> list[dict]:
     persona_hint = f"\n\nPERSONA:\n{persona}" if persona else ""
 
     while True:
-        # Build choices: each post as an editable pick, plus refine-all and accept
-        choices = []
+        # Build choices: accept and refine first, then individual posts
+        choices = [
+            questionary.Choice("Accept and continue", value=("accept", None)),
+            questionary.Choice("Refine all with AI feedback", value=("refine", None)),
+        ]
         for i, p in enumerate(posts, 1):
             label = POST_TYPES.get(p.get("type", ""), {}).get("label", p.get("type", ""))
             preview = p.get("draft", "")[:60] + "…" if len(p.get("draft", "")) > 60 else p.get("draft", "")
-            choices.append(questionary.Choice(f"{i}. {label} — {preview}", value=("edit", i - 1)))
-        choices.append(questionary.Choice("Refine all with AI feedback", value=("refine", None)))
-        choices.append(questionary.Choice("Accept and continue", value=("accept", None)))
+            choices.append(questionary.Choice(f"Edit {i}. {label} — {preview}", value=("edit", i - 1)))
 
-        result = questionary.select("Pick a post to edit, or:", choices=choices).ask()
+        result = questionary.select("What next?", choices=choices).ask()
         if result is None:
             break
         action, idx = result
@@ -1321,9 +1380,82 @@ def main():
 
     console.print()
 
-    if args.platform == "blog":
-        # Blog post flow
-        blog = generate_blog(sessions, model=args.model, persona=persona, past_posts=past_posts, git_logs=git_logs)
+    # ── Platform selection ────────────────────────────────────────────────
+    platform = args.platform
+    if not platform:
+        platform_choices = [
+            questionary.Choice("Twitter  (280 chars, punchy)", value="twitter"),
+            questionary.Choice("Bluesky  (300 chars, casual)", value="bluesky"),
+            questionary.Choice("Mastodon (500 chars, technical)", value="mastodon"),
+            questionary.Choice("Threads  (500 chars, brief)", value="threads"),
+            questionary.Choice("LinkedIn (3000 chars, professional)", value="linkedin"),
+            questionary.Choice("Blog post (long-form devlog)", value="blog"),
+        ]
+        platform = questionary.select("Where do you want to post?", choices=platform_choices).ask()
+        if platform is None:
+            return
+
+    # ── Generate ──────────────────────────────────────────────────────────
+    if platform == "blog":
+        # Blog flow: pick projects → pick angle → generate
+
+        # Narrow projects (skip if already filtered by --project)
+        blog_sessions = sessions
+        if not selected_project:
+            projects_in_range: dict[str, int] = defaultdict(int)
+            for s in sessions:
+                projects_in_range[s["project"]] += 1
+            if len(projects_in_range) > 1:
+                proj_choices = [
+                    questionary.Choice(
+                        f"{name} ({count} sessions)",
+                        value=name,
+                        checked=True,
+                    )
+                    for name, count in sorted(projects_in_range.items(), key=lambda x: -x[1])
+                ]
+                selected_projects = questionary.checkbox(
+                    "Which projects to include?",
+                    choices=proj_choices,
+                ).ask()
+                if selected_projects is None:
+                    return
+                if selected_projects:
+                    blog_sessions = [s for s in sessions if s["project"] in selected_projects]
+                if not blog_sessions:
+                    console.print("  [dim]No sessions selected.[/dim]")
+                    return
+
+        # Suggest angles
+        blog_git_logs = {k: v for k, v in git_logs.items()
+                         if any(s["project"] == k for s in blog_sessions)} if git_logs else None
+        angles = suggest_blog_angles(blog_sessions, persona, git_logs=blog_git_logs, model=args.model)
+
+        angle = None
+        if angles:
+            angle_choices = []
+            for a in angles:
+                scope = a.get("scope", "")
+                title = a.get("title", "")
+                desc = a.get("description", "")
+                angle_choices.append(questionary.Choice(f"[{scope}] {title} — {desc}", value=title))
+            angle_choices.append(questionary.Choice("Write my own angle…", value="__custom__"))
+            angle_choices.append(questionary.Choice("No focus — use everything", value="__none__"))
+
+            picked = questionary.select("Pick a blog angle:", choices=angle_choices).ask()
+            if picked is None:
+                return
+            if picked == "__custom__":
+                try:
+                    angle = pt_prompt("Blog angle/focus: ").strip() or None
+                except (EOFError, KeyboardInterrupt):
+                    return
+            elif picked != "__none__":
+                angle = picked
+
+        # Generate
+        blog = generate_blog(blog_sessions, model=args.model, persona=persona,
+                             past_posts=past_posts, git_logs=blog_git_logs, angle=angle)
         save_last_run(now)
 
         console.rule("[bold]Devlog[/bold]")
@@ -1335,11 +1467,11 @@ def main():
         save_blog(blog, now.strftime("%Y-%m-%d"), project=selected_project)
     else:
         # Social posts flow
-        posts = generate_posts(sessions, model=args.model, persona=persona, past_posts=past_posts, git_logs=git_logs, platform=args.platform)
+        posts = generate_posts(sessions, model=args.model, persona=persona,
+                               past_posts=past_posts, git_logs=git_logs, platform=platform)
         save_last_run(now)
 
-        plat_label = f"  ·  {args.platform}" if args.platform else ""
-        console.rule(f"[bold]Suggested posts{plat_label}[/bold]")
+        console.rule(f"[bold]Suggested posts  ·  {platform}[/bold]")
         console.print()
 
         print_posts(posts)
